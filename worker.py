@@ -51,6 +51,9 @@ def process_submission(task):
         network_disabled=True,
         mem_limit="128m",
         pids_limit=50,
+        user="1000:1000",
+        cap_drop=["ALL"],
+        working_dir="/tmp",
       )
       
       timeout_seconds = 2.0
