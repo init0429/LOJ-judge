@@ -4,17 +4,27 @@ import os
 import time
 import base64
 import docker
+from supabase import create_client, Client
+
+url: str = os.environ.get("SUPABASE_URL")
+key: str = os.environ.get("SUPABASE_KEY")
+supabase: Client = create_client(url, key)
 
 redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
 r = redis.from_url(redis_url, health_check_interval=30)
 
 client = docker.from_env()
 
+def update_status(sub_id, status):
+  supabase.table("submissions").update({"status": status}).eq("id", sub_id).execute()
+
 def process_submission(task):
   sub_id = task['submission_id']
   code = task['code']
   language = task['language']
   test_cases = task.get('test_cases', [])
+
+  update_status(sub_id, "Running")
   
   print(f"\n[{sub_id}] 채점 시작 (총 {len(test_cases)}개의 테스트케이스)")
 
@@ -30,7 +40,7 @@ def process_submission(task):
       image = "python:3.11-alpine"
       command = f"echo '{encoded_code}' | base64 -d > main.py && echo '{encoded_input}' | base64 -d | python3 main.py"
     else:
-      print(f"[{sub_id}] ❌ 지원하지 않는 언어입니다.")
+      print(f"[{sub_id}] 지원하지 않는 언어입니다.")
       return
 
     try:
@@ -65,12 +75,13 @@ def process_submission(task):
       container.remove()
 
       if result['StatusCode'] != 0:
-        print(f"[{sub_id}] ⚠️ Testcase #{idx}: 런타임 에러 (Runtime Error)\n{logs.strip()}")
+        print(f"[{sub_id}] Testcase #{idx}: 런타임 에러 (Runtime Error)\n{logs.strip()}")
         return
           
       if logs.strip() == expected_output.strip():
         print(f"[{sub_id}] Testcase #{idx}: 통과 (정답: {expected_output.strip()} / 출력: {logs.strip()})")
       else:
+        update_status(sub_id, "Wrong Answer")
         print(f"[{sub_id}] Testcase #{idx}: 오답 (Wrong Answer)")
         print(f"   - 예상 정답: {expected_output.strip()}")
         print(f"   - 실제 출력: {logs.strip()}")
@@ -80,6 +91,7 @@ def process_submission(task):
       print(f"[{sub_id}] 시스템 에러: {str(e)}")
       return
 
+  update_status(sub_id, "Accepted")
   print(f"[{sub_id}] 모든 테스트케이스 통과! (Accepted)\n")
 
 def main():
