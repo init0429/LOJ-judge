@@ -29,6 +29,47 @@ client = docker.from_env()
 # - run: 실행 명령 (표준입력은 파이프로 붙음)
 # - mem_limit / timeout: 언어별로 다르게 줄 필요가 있어 개별 지정 (예: JVM은 기본보다 더 필요)
 LANGUAGES = {
+    "javascript": {
+        "image": "node:24-alpine",
+        "filename": "main.js",
+        "compile": None,
+        "run": "node --max-old-space-size=96 /tmp/main.js",
+        "mem_limit": "256m",
+        "timeout": 5.0,
+    },
+    "typescript": {
+        "image": "node:24-alpine",
+        "filename": "main.ts",
+        "compile": None,
+        # Native type stripping supports erasable syntax, not tsc or npm packages.
+        "run": "node --max-old-space-size=96 /tmp/main.ts",
+        "mem_limit": "256m",
+        "timeout": 5.0,
+    },
+    "ruby": {
+        "image": "ruby:3.4-alpine",
+        "filename": "main.rb",
+        "compile": None,
+        "run": "ruby /tmp/main.rb",
+        "mem_limit": "128m",
+        "timeout": 5.0,
+    },
+    "php": {
+        "image": "php:8.4-cli-alpine",
+        "filename": "main.php",
+        "compile": None,
+        "run": "php -d memory_limit=96M /tmp/main.php",
+        "mem_limit": "128m",
+        "timeout": 5.0,
+    },
+    "perl": {
+        "image": "perl:5.40-slim",
+        "filename": "main.pl",
+        "compile": None,
+        "run": "perl /tmp/main.pl",
+        "mem_limit": "128m",
+        "timeout": 5.0,
+    },
     "python": {
         "image": "python:3.11-alpine",
         "filename": "main.py",
