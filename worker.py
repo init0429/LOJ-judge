@@ -4,6 +4,9 @@ import os
 import time
 import base64
 import threading
+import logging
+from requests.exceptions import ReadTimeout, ConnectionError as RequestsConnectionError
+from urllib3.exceptions import ReadTimeoutError
 from concurrent.futures import ThreadPoolExecutor
 
 import docker
@@ -158,8 +161,14 @@ def _run_container(cfg: dict, command: str, timeout_seconds: float):
     공통 컨테이너 실행 헬퍼. (exit_code, logs, timed_out) 반환
     """
     container = None
+    stream = None
+    reader = None
+    output = [bytearray(), bytearray()]
+    failures = []
+    overflow = threading.Event()
+    limit = 1024 * 1024
     try:
-        container = client.containers.run(
+        container = client.containers.create(
             image=cfg["image"],
             command=["sh", "-c", command],
             detach=True,
@@ -168,20 +177,60 @@ def _run_container(cfg: dict, command: str, timeout_seconds: float):
             pids_limit=50,
             user="1000:1000",
             cap_drop=["ALL"],
+            read_only=True,
+            tmpfs={"/tmp": "rw,exec,nosuid,size=64m,mode=1777"},
+            log_config=docker.types.LogConfig(type="none"),
             working_dir="/tmp",
         )
+        # Attach before starting so short programs cannot outrun output capture.
+        stream = container.attach(stdout=True, stderr=True, stream=True, demux=True)
+
+        def capture():
+            try:
+                for stdout, stderr in stream:
+                    for index, chunk in enumerate((stdout, stderr)):
+                        if not chunk:
+                            continue
+                        remaining = limit - sum(map(len, output))
+                        output[index].extend(chunk[:remaining])
+                        if len(chunk) > remaining:
+                            overflow.set()
+                            try:
+                                container.kill()
+                            except docker.errors.APIError as exc:
+                                if exc.status_code != 409:
+                                    raise
+                            return
+            except Exception as exc:
+                failures.append(exc)
+
+        container.start()
+        reader = threading.Thread(target=capture, daemon=True)
+        reader.start()
 
         try:
             result = container.wait(timeout=timeout_seconds)
-        except Exception:
+        except (ReadTimeout, RequestsConnectionError) as exc:
+            if not isinstance(exc, ReadTimeout) and not any(
+                isinstance(arg, ReadTimeoutError) for arg in exc.args
+            ):
+                raise
             try:
                 container.kill()
             except Exception:
                 pass
             return None, "", True
 
-        logs = container.logs().decode("utf-8", errors="replace").strip()
+        reader.join(timeout=5)
+        if reader.is_alive():
+            raise RuntimeError("Sandbox output reader did not finish")
+        if failures:
+            raise RuntimeError("Sandbox output capture failed") from failures[0]
+        if overflow.is_set():
+            return 1, "Output limit exceeded", False
         exit_code = result.get("StatusCode", -1)
+        raw = output[0] if exit_code == 0 else output[0] + output[1]
+        logs = raw.decode("utf-8", errors="replace").strip()
         return exit_code, logs, False
     finally:
         if container is not None:
@@ -189,6 +238,13 @@ def _run_container(cfg: dict, command: str, timeout_seconds: float):
                 container.remove(force=True)
             except Exception:
                 pass
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                logging.exception("Failed to close sandbox output stream")
+        if reader is not None:
+            reader.join(timeout=5)
 
 
 def compile_check(sub_id: str, cfg: dict, encoded_code: str):
@@ -214,7 +270,7 @@ def compile_check(sub_id: str, cfg: dict, encoded_code: str):
         return False, "컴파일 시간 초과"
 
     if exit_code != 0:
-        print(f"[{sub_id}] 컴파일 실패:\n{logs}")
+        print(f"[{sub_id}] 컴파일 실패:\n{logs[:4096]}")
         return False, logs
 
     return True, ""
@@ -233,7 +289,7 @@ def run_one_testcase(sub_id: str, cfg: dict, encoded_code: str, tc: dict):
     write_code = f"echo {encoded_code} | base64 -d > /tmp/{cfg['filename']}"
     steps = [write_code]
     if cfg["compile"]:
-        steps.append(cfg["compile"])
+        steps.append(f"{cfg['compile']} 1>&2")
     steps.append(f"echo {encoded_input} | base64 -d | {cfg['run']}")
     command = " && ".join(steps)
 
@@ -251,7 +307,7 @@ def run_one_testcase(sub_id: str, cfg: dict, encoded_code: str, tc: dict):
         return "Time Limit Exceeded", ""
 
     if exit_code != 0:
-        print(f"[{sub_id}] Testcase: 런타임 에러 (exit code {exit_code})\n{logs}")
+        print(f"[{sub_id}] Testcase: 런타임 에러 (exit code {exit_code})\n{logs[:4096]}")
         return "Runtime Error", logs
 
     if logs == expected_output.strip():
@@ -263,6 +319,22 @@ def run_one_testcase(sub_id: str, cfg: dict, encoded_code: str, tc: dict):
 
 
 def process_submission(task: dict):
+    try:
+        _process_submission(task)
+    except Exception:
+        logging.exception("Submission processing failed: %s", task.get("submission_id"))
+        sub_id = task.get("submission_id")
+        if sub_id is None:
+            raise
+        if task.get("is_test", False):
+            r.publish(f"test_result:{sub_id}", json.dumps({
+                "status": "System Error", "test_cases": [],
+            }))
+        else:
+            update_status(sub_id, "System Error")
+
+
+def _process_submission(task: dict):
     sub_id = task["submission_id"]
     code = task["code"]
     language = task["language"]
@@ -358,6 +430,11 @@ def main():
 
         def on_done(_future):
             nonlocal inflight
+            if _future.exception() is not None:
+                logging.error("Judge task failed", exc_info=(
+                    type(_future.exception()), _future.exception(),
+                    _future.exception().__traceback__,
+                ))
             with inflight_lock:
                 inflight -= 1
 
