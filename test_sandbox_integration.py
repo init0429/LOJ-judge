@@ -38,11 +38,11 @@ class SandboxIntegrationTests(unittest.TestCase):
 
     def judge(self, language, code, cases):
         cfg = self.worker.LANGUAGES[language]
-        ok, message = self.worker.compile_check("test", cfg, code)
-        if not ok:
+        program, message = self.worker.build_program("test", cfg, code)
+        if program is None:
             return "Compile Error", message
         for case in cases:
-            status, actual = self.worker.run_one_testcase("test", cfg, code, case)
+            status, actual = self.worker.run_one_testcase("test", cfg, program, case)
             if status != "Accepted":
                 return status, actual
         return "Accepted", ""

@@ -48,8 +48,16 @@ def load_worker():
     return module
 
 
-CFG = {"image": "python", "mem_limit": "128m"}
 FILES = {"main.py": b"print(3)"}
+C = {"image": "gcc", "filename": "main.c", "compile": "gcc -o /tmp/main /tmp/main.c",
+     "artifact": "main", "run": "/tmp/main", "mem_limit": "128m", "timeout": 5.0}
+PYTHON = {"image": "python", "filename": "main.py", "compile": None,
+          "run": "python3 /tmp/main.py", "mem_limit": "128m", "timeout": 5.0}
+
+
+def run(worker, files=FILES, **options):
+    options = {"mem_limit": "128m", "timeout": 1} | options
+    return worker._run_container("python", "run", files, **options)
 
 
 def sandbox(worker, chunks, wait=None):
@@ -93,8 +101,9 @@ class WorkerSafetyTests(unittest.TestCase):
     def test_container_storage_limits_and_stdout_capture(self):
         worker = load_worker()
         container, _ = sandbox(worker, [(b"3\n", b"diagnostic")])
-        result = worker._run_container(CFG, "run", 1, FILES)
-        self.assertEqual(result, (0, "3", False))
+        result = run(worker)
+        self.assertEqual(result, worker.SandboxResult(0, b"3\n", b"diagnostic"))
+        self.assertEqual(result.text(), "3")
         container.logs.assert_not_called()
         worker.docker.types.LogConfig.assert_called_once_with(type="none")
         options = worker.client.containers.create.call_args.kwargs
@@ -109,7 +118,7 @@ class WorkerSafetyTests(unittest.TestCase):
         worker = load_worker()
         container, _ = sandbox(worker, [(b"ok", None)])
         files = {"main.py": b"print(1)", ".stdin": b"7 " * 400_000}
-        worker._run_container(CFG, "run", 1, files)
+        run(worker, files)
         options = worker.client.containers.create.call_args.kwargs
         self.assertEqual(options["command"], ["sh", "-c", "run"])
         self.assertTrue(options["stdin_open"])
@@ -124,32 +133,68 @@ class WorkerSafetyTests(unittest.TestCase):
         worker = load_worker()
         sandbox(worker, [(None, f"tar: short read\n{worker.BUNDLE_FAILED}\n".encode())], wait={"StatusCode": 125})
         with self.assertRaises(RuntimeError):
-            worker._run_container(CFG, "run", 1, FILES)
+            run(worker)
 
     def test_program_ending_before_reading_input_is_not_an_error(self):
         worker = load_worker()
         container, _ = sandbox(worker, [(b"3", None)])
         container.attach_socket.return_value._sock.sendall.side_effect = BrokenPipeError()
-        self.assertEqual(worker._run_container(CFG, "run", 1, FILES), (0, "3", False))
+        self.assertEqual(run(worker).text(), "3")
 
-    def test_testcase_command_reads_input_from_the_bundle(self):
+    def test_testcase_runs_the_prebuilt_program_without_compiling(self):
         worker = load_worker()
-        worker._run_container = Mock(return_value=(0, "3", False))
-        cfg = {"image": "gcc", "filename": "main.c", "compile": "gcc main.c", "run": "/tmp/main", "timeout": 5.0}
-        status, _ = worker.run_one_testcase("one", cfg, "int main(){}", {"input": "1 2", "output": "3\n"})
+        worker._run_container = Mock(return_value=worker.SandboxResult(0, b"3\n"))
+        status, _ = worker.run_one_testcase("one", C, {"main": b"ELF"}, {"input": "1 2", "output": "3\n"})
         self.assertEqual(status, "Accepted")
-        command, _, files = worker._run_container.call_args.args[1:]
-        self.assertTrue(command.startswith(worker.UNPACK))
-        self.assertTrue(command.endswith("/tmp/main < /tmp/.stdin"))
-        self.assertEqual(files, {"main.c": b"int main(){}", ".stdin": b"1 2"})
+        image, command, files = worker._run_container.call_args.args
+        self.assertEqual(command, f"{worker.UNPACK} && /tmp/main < /tmp/.stdin")
+        self.assertEqual(files, {"main": b"ELF", ".stdin": b"1 2"})
+        self.assertEqual(worker._run_container.call_args.kwargs, {"mem_limit": "128m", "timeout": 5.0})
+
+    def test_compiled_languages_build_once_per_submission(self):
+        worker = load_worker()
+        worker.LANGUAGES = {"c": C}
+        worker.update_status = Mock()
+        worker._run_container = Mock(side_effect=[worker.SandboxResult(0, b"ELF")] + [worker.SandboxResult(0, b"3")] * 3)
+        worker._process_submission({
+            "submission_id": "one", "language": "c", "code": "int main(){}",
+            "test_cases": [{"input": "1 2", "output": "3"}] * 3,
+        })
+        commands = [call.args[1] for call in worker._run_container.call_args_list]
+        self.assertEqual([C["compile"] in command for command in commands], [True, False, False, False])
+        self.assertTrue(commands[0].endswith("1>&2 && cat /tmp/main"))
+        compile_options = worker._run_container.call_args_list[0].kwargs
+        self.assertEqual(compile_options["mem_limit"], worker.COMPILE_MEM_LIMIT)
+        self.assertEqual(compile_options["timeout"], worker.COMPILE_TIMEOUT)
+        worker.update_status.assert_called_with("one", "Accepted")
+
+    def test_interpreted_languages_ship_the_source_as_is(self):
+        worker = load_worker()
+        worker._run_container = Mock()
+        self.assertEqual(worker.build_program("one", PYTHON, "print(3)"), ({"main.py": b"print(3)"}, ""))
+        worker._run_container.assert_not_called()
+
+    def test_compile_failures_report_the_compiler_diagnostics(self):
+        worker = load_worker()
+        for result, expected in (
+            (worker.SandboxResult(1, b"", b"main.c:1: error: nope\n"), "main.c:1: error: nope"),
+            (worker.SandboxResult(None, timed_out=True), "컴파일 시간 초과"),
+            (worker.SandboxResult(1, overflow=True), "컴파일 출력이 너무 큽니다"),
+        ):
+            worker._run_container = Mock(return_value=result)
+            self.assertEqual(worker.build_program("one", C, "int main(){}"), (None, expected))
 
     def test_output_overflow_never_returns_success(self):
         for chunks in ([(b"3", None), (b"x" * 1048576, None)],
                        [(b"3", b"x" * 1048576)]):
             worker = load_worker()
             container, _ = sandbox(worker, chunks)
-            result = worker._run_container(CFG, "run", 1, FILES)
-            self.assertEqual(result, (1, "Output limit exceeded", False))
+            result = run(worker)
+            self.assertTrue(result.overflow)
+            self.assertNotEqual(result.exit_code, 0)
+            worker._run_container = Mock(return_value=result)
+            self.assertEqual(worker.run_one_testcase("one", PYTHON, FILES, {"input": "", "output": "3"}),
+                             ("Runtime Error", "Output limit exceeded"))
             container.kill.assert_called_once()
             container.remove.assert_called_once_with(force=True)
 
@@ -159,8 +204,8 @@ class WorkerSafetyTests(unittest.TestCase):
         stream.close.side_effect = OSError("already closed")
         container.attach_socket.return_value.close.side_effect = RuntimeError("broken")
         with self.assertLogs(level="ERROR"):
-            result = worker._run_container(CFG, "run", 1, FILES)
-        self.assertEqual(result, (None, "", True))
+            result = run(worker)
+        self.assertEqual(result, worker.SandboxResult(None, timed_out=True))
         container.remove.assert_called_once_with(force=True)
 
 
