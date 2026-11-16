@@ -3,6 +3,7 @@ import ast
 import json
 import logging
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -15,7 +16,7 @@ def worker_functions():
         body=[node for node in tree.body if isinstance(node, ast.FunctionDef)],
         type_ignores=[],
     )
-    namespace = {"json": json, "logging": logging, "threading": threading,
+    namespace = {"json": json, "logging": logging, "threading": threading, "time": time,
                  "ReadTimeout": TimeoutError, "RequestsConnectionError": ConnectionError,
                  "ReadTimeoutError": TimeoutError}
     exec(compile(functions, "worker.py", "exec"), namespace)
@@ -23,6 +24,12 @@ def worker_functions():
 
 
 class WorkerSafetyTests(unittest.TestCase):
+    def test_expired_test_job_does_not_execute(self):
+        ns = worker_functions()
+        ns["_process_submission"] = Mock()
+        ns["process_submission"]({"is_test": True, "expires_at": 0})
+        ns["_process_submission"].assert_not_called()
+
     def test_processing_failure_marks_submission_terminal(self):
         ns = worker_functions()
         ns["_process_submission"] = Mock(side_effect=RuntimeError("Docker unavailable"))

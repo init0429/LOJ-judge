@@ -320,6 +320,8 @@ def run_one_testcase(sub_id: str, cfg: dict, encoded_code: str, tc: dict):
 
 def process_submission(task: dict):
     try:
+        if task.get("is_test") and task.get("expires_at", float("inf")) <= time.time():
+            return
         _process_submission(task)
     except Exception:
         logging.exception("Submission processing failed: %s", task.get("submission_id"))
@@ -383,6 +385,8 @@ def _process_submission(task: dict):
     test_results = []
 
     for idx, tc in enumerate(test_cases, 1):
+        if is_test and task.get("expires_at", float("inf")) <= time.time():
+            return
         status, actual = run_one_testcase(sub_id, cfg, encoded_code, tc)
 
         test_results.append({
