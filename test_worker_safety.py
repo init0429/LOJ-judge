@@ -1,8 +1,10 @@
 """Isolated worker regressions without connecting to external services."""
 import importlib.util
+import io
 import json
 from pathlib import Path
 import sys
+import tarfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, Mock, patch
@@ -46,6 +48,10 @@ def load_worker():
     return module
 
 
+CFG = {"image": "python", "mem_limit": "128m"}
+FILES = {"main.py": b"print(3)"}
+
+
 def sandbox(worker, chunks, wait=None):
     """Wire a fake container whose attached stream yields the given chunks."""
     container = Mock()
@@ -87,7 +93,7 @@ class WorkerSafetyTests(unittest.TestCase):
     def test_container_storage_limits_and_stdout_capture(self):
         worker = load_worker()
         container, _ = sandbox(worker, [(b"3\n", b"diagnostic")])
-        result = worker._run_container({"image": "python", "mem_limit": "128m"}, "run", 1)
+        result = worker._run_container(CFG, "run", 1, FILES)
         self.assertEqual(result, (0, "3", False))
         container.logs.assert_not_called()
         worker.docker.types.LogConfig.assert_called_once_with(type="none")
@@ -99,12 +105,50 @@ class WorkerSafetyTests(unittest.TestCase):
         self.assertIn("exec", options["tmpfs"]["/tmp"].split(","))
         container.remove.assert_called_once_with(force=True)
 
+    def test_files_reach_the_sandbox_over_stdin_not_argv(self):
+        worker = load_worker()
+        container, _ = sandbox(worker, [(b"ok", None)])
+        files = {"main.py": b"print(1)", ".stdin": b"7 " * 400_000}
+        worker._run_container(CFG, "run", 1, files)
+        options = worker.client.containers.create.call_args.kwargs
+        self.assertEqual(options["command"], ["sh", "-c", "run"])
+        self.assertTrue(options["stdin_open"])
+        self.assertFalse(options["detach"])
+        raw = container.attach_socket.return_value._sock
+        with tarfile.open(fileobj=io.BytesIO(raw.sendall.call_args.args[0])) as archive:
+            self.assertEqual({m.name: archive.extractfile(m).read() for m in archive}, files)
+            self.assertEqual({m.uid for m in archive}, {1000})
+        raw.shutdown.assert_called_once()
+
+    def test_undelivered_bundle_is_a_system_failure(self):
+        worker = load_worker()
+        sandbox(worker, [(None, f"tar: short read\n{worker.BUNDLE_FAILED}\n".encode())], wait={"StatusCode": 125})
+        with self.assertRaises(RuntimeError):
+            worker._run_container(CFG, "run", 1, FILES)
+
+    def test_program_ending_before_reading_input_is_not_an_error(self):
+        worker = load_worker()
+        container, _ = sandbox(worker, [(b"3", None)])
+        container.attach_socket.return_value._sock.sendall.side_effect = BrokenPipeError()
+        self.assertEqual(worker._run_container(CFG, "run", 1, FILES), (0, "3", False))
+
+    def test_testcase_command_reads_input_from_the_bundle(self):
+        worker = load_worker()
+        worker._run_container = Mock(return_value=(0, "3", False))
+        cfg = {"image": "gcc", "filename": "main.c", "compile": "gcc main.c", "run": "/tmp/main", "timeout": 5.0}
+        status, _ = worker.run_one_testcase("one", cfg, "int main(){}", {"input": "1 2", "output": "3\n"})
+        self.assertEqual(status, "Accepted")
+        command, _, files = worker._run_container.call_args.args[1:]
+        self.assertTrue(command.startswith(worker.UNPACK))
+        self.assertTrue(command.endswith("/tmp/main < /tmp/.stdin"))
+        self.assertEqual(files, {"main.c": b"int main(){}", ".stdin": b"1 2"})
+
     def test_output_overflow_never_returns_success(self):
         for chunks in ([(b"3", None), (b"x" * 1048576, None)],
                        [(b"3", b"x" * 1048576)]):
             worker = load_worker()
             container, _ = sandbox(worker, chunks)
-            result = worker._run_container({"image": "python", "mem_limit": "128m"}, "run", 1)
+            result = worker._run_container(CFG, "run", 1, FILES)
             self.assertEqual(result, (1, "Output limit exceeded", False))
             container.kill.assert_called_once()
             container.remove.assert_called_once_with(force=True)
@@ -112,9 +156,10 @@ class WorkerSafetyTests(unittest.TestCase):
     def test_wrapped_timeout_and_cleanup_failure(self):
         worker = load_worker()
         container, stream = sandbox(worker, [], wait=ConnectionError(TimeoutError("read timed out")))
-        stream.close.side_effect = OSError("closed")
+        stream.close.side_effect = OSError("already closed")
+        container.attach_socket.return_value.close.side_effect = RuntimeError("broken")
         with self.assertLogs(level="ERROR"):
-            result = worker._run_container({"image": "python", "mem_limit": "128m"}, "run", 1)
+            result = worker._run_container(CFG, "run", 1, FILES)
         self.assertEqual(result, (None, "", True))
         container.remove.assert_called_once_with(force=True)
 

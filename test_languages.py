@@ -1,8 +1,6 @@
-"""Run with python -m unittest test_languages; Docker checks are opt-in."""
+"""Static checks on the language table; see test_sandbox_integration for Docker runs."""
 import ast
-import os
 from pathlib import Path
-import subprocess
 import unittest
 
 
@@ -34,18 +32,6 @@ class LanguageTests(unittest.TestCase):
                 self.assertGreater(cfg["timeout"], 0)
                 self.assertTrue(cfg["mem_limit"].endswith("m"))
 
-    @unittest.skipUnless(os.getenv("RUN_DOCKER_TESTS") == "1", "Set RUN_DOCKER_TESTS=1 to run sandbox smoke tests")
-    def test_addition_in_sandbox(self):
-        import base64
-        for language, code in SAMPLES.items():
-            cfg = load_languages()[language]
-            encoded = base64.b64encode(code.encode()).decode()
-            command = f"echo {encoded} | base64 -d > /tmp/{cfg['filename']} && printf '1 2' | {cfg['run']}"
-            with self.subTest(language=language):
-                result = subprocess.run([
-                    "docker", "run", "--rm", "--network=none", "--user=1000:1000",
-                    "--cap-drop=ALL", "--pids-limit=50", f"--memory={cfg['mem_limit']}",
-                    "--workdir=/tmp", cfg["image"], "sh", "-c", command,
-                ], capture_output=True, text=True, timeout=120)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.strip(), "3")
+
+if __name__ == "__main__":
+    unittest.main()

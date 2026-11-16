@@ -1,8 +1,10 @@
 import redis
+import io
 import json
 import os
+import socket
+import tarfile
 import time
-import base64
 import threading
 import logging
 from requests.exceptions import ReadTimeout, ConnectionError as RequestsConnectionError
@@ -131,6 +133,27 @@ LANGUAGES = {
 }
 
 
+# 소스코드와 입력은 tar 묶음으로 만들어 컨테이너 stdin에 흘려보내고 /tmp에 풀어서 씀.
+# 명령행 인자로 넘기면 리눅스의 인자 하나당 128KB 제한(MAX_ARG_STRLEN)에 걸려서
+# 큰 코드나 큰 입력은 컨테이너가 아예 뜨지 못함.
+BUNDLE_FAILED = "__LOJ_BUNDLE_FAILED__"
+UNPACK = f"tar -xf - -C /tmp || {{ echo {BUNDLE_FAILED} >&2; exit 125; }}"
+STDIN_FILE = ".stdin"
+
+
+def _bundle(files: dict) -> bytes:
+    """{파일명: bytes}를 샌드박스 사용자(1000) 소유의 tar 묶음으로 만든다."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o755
+            info.uid = info.gid = 1000
+            archive.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
 def update_status(sub_id: str, status: str):
     try:
         supabase.table("submissions").update({"status": status}).eq("id", sub_id).execute()
@@ -156,13 +179,17 @@ def pull_images_on_startup():
                 print(f"[startup] {lang} 이미지 pull 실패 ({image}): {e}")
 
 
-def _run_container(cfg: dict, command: str, timeout_seconds: float):
+def _run_container(cfg: dict, command: str, timeout_seconds: float, files: dict):
     """
     공통 컨테이너 실행 헬퍼. (exit_code, logs, timed_out) 반환
+    files는 실행 전에 /tmp에 풀리는 {파일명: bytes} (command가 UNPACK으로 시작해야 함)
     """
     container = None
     stream = None
+    stdin = None
     reader = None
+    feeder = None
+    payload = _bundle(files)
     output = [bytearray(), bytearray()]
     failures = []
     overflow = threading.Event()
@@ -171,7 +198,9 @@ def _run_container(cfg: dict, command: str, timeout_seconds: float):
         container = client.containers.create(
             image=cfg["image"],
             command=["sh", "-c", command],
-            detach=True,
+            # stdin을 붙이려면 detach=False여야 AttachStdin/StdinOnce가 켜짐
+            detach=False,
+            stdin_open=True,
             network_disabled=True,
             mem_limit=cfg["mem_limit"],
             # 동시 채점끼리 CPU를 나눠 쓰며 실행 시간이 흔들리지 않도록 1코어로 고정
@@ -187,6 +216,17 @@ def _run_container(cfg: dict, command: str, timeout_seconds: float):
         )
         # Attach before starting so short programs cannot outrun output capture.
         stream = container.attach(stdout=True, stderr=True, stream=True, demux=True)
+        stdin = container.attach_socket(params={"stdin": 1, "stream": 1})
+
+        def feed():
+            try:
+                raw = getattr(stdin, "_sock", stdin)
+                raw.sendall(payload)
+                raw.shutdown(socket.SHUT_WR)
+            except OSError:
+                # 묶음을 다 읽기 전에 컨테이너가 끝났거나 강제 종료된 경우.
+                # 전달 실패 여부는 아래에서 종료 코드(BUNDLE_FAILED)로 판별함.
+                pass
 
         def capture():
             try:
@@ -210,6 +250,8 @@ def _run_container(cfg: dict, command: str, timeout_seconds: float):
         container.start()
         reader = threading.Thread(target=capture, daemon=True)
         reader.start()
+        feeder = threading.Thread(target=feed, daemon=True)
+        feeder.start()
 
         try:
             result = container.wait(timeout=timeout_seconds)
@@ -232,6 +274,8 @@ def _run_container(cfg: dict, command: str, timeout_seconds: float):
         if overflow.is_set():
             return 1, "Output limit exceeded", False
         exit_code = result.get("StatusCode", -1)
+        if exit_code == 125 and BUNDLE_FAILED.encode() in output[1]:
+            raise RuntimeError("Sandbox bundle delivery failed")
         raw = output[0] if exit_code == 0 else output[0] + output[1]
         logs = raw.decode("utf-8", errors="replace").strip()
         return exit_code, logs, False
@@ -241,16 +285,20 @@ def _run_container(cfg: dict, command: str, timeout_seconds: float):
                 container.remove(force=True)
             except Exception:
                 pass
-        if stream is not None:
-            try:
-                stream.close()
-            except Exception:
-                logging.exception("Failed to close sandbox output stream")
-        if reader is not None:
-            reader.join(timeout=5)
+        for attached in (stream, stdin):
+            if attached is not None:
+                try:
+                    attached.close()
+                except OSError:
+                    pass  # 컨테이너가 먼저 끝나 이미 닫힌 소켓
+                except Exception:
+                    logging.exception("Failed to close sandbox stream")
+        for thread in (reader, feeder):
+            if thread is not None:
+                thread.join(timeout=5)
 
 
-def compile_check(sub_id: str, cfg: dict, encoded_code: str):
+def compile_check(sub_id: str, cfg: dict, code: str):
     """
     컴파일이 필요한 언어에 한해, 테스트케이스 루프 들어가기 전에 딱 한 번
     컴파일만 시도해서 성공 여부를 확인함. (Compile Error를 Runtime Error와
@@ -263,10 +311,10 @@ def compile_check(sub_id: str, cfg: dict, encoded_code: str):
     if cfg["compile"] is None:
         return True, ""
 
-    write_code = f"echo {encoded_code} | base64 -d > /tmp/{cfg['filename']}"
-    command = f"{write_code} && {cfg['compile']}"
+    command = f"{UNPACK} && {cfg['compile']}"
+    files = {cfg["filename"]: code.encode("utf-8")}
 
-    exit_code, logs, timed_out = _run_container(cfg, command, timeout_seconds=10.0)
+    exit_code, logs, timed_out = _run_container(cfg, command, 10.0, files)
 
     if timed_out:
         print(f"[{sub_id}] 컴파일 시간 초과")
@@ -279,25 +327,26 @@ def compile_check(sub_id: str, cfg: dict, encoded_code: str):
     return True, ""
 
 
-def run_one_testcase(sub_id: str, cfg: dict, encoded_code: str, tc: dict):
+def run_one_testcase(sub_id: str, cfg: dict, code: str, tc: dict):
     """
     테스트케이스 하나를 컨테이너에서 실행하고 결과를 반환
     반환값: (status, actual_output)
     status: "Accepted" | "Wrong Answer" | "Time Limit Exceeded" | "Runtime Error" | "System Error"
     """
-    test_input = tc["input"]
     expected_output = tc["output"]
-    encoded_input = base64.b64encode(test_input.encode("utf-8")).decode("utf-8")
+    files = {
+        cfg["filename"]: code.encode("utf-8"),
+        STDIN_FILE: (tc["input"] or "").encode("utf-8"),
+    }
 
-    write_code = f"echo {encoded_code} | base64 -d > /tmp/{cfg['filename']}"
-    steps = [write_code]
+    steps = [UNPACK]
     if cfg["compile"]:
         steps.append(f"{cfg['compile']} 1>&2")
-    steps.append(f"echo {encoded_input} | base64 -d | {cfg['run']}")
+    steps.append(f"{cfg['run']} < /tmp/{STDIN_FILE}")
     command = " && ".join(steps)
 
     try:
-        exit_code, logs, timed_out = _run_container(cfg, command, timeout_seconds=cfg["timeout"])
+        exit_code, logs, timed_out = _run_container(cfg, command, cfg["timeout"], files)
     except docker.errors.ImageNotFound:
         print(f"[{sub_id}] Docker 이미지 없음: {cfg['image']}")
         return "System Error", ""
@@ -371,9 +420,7 @@ def _process_submission(task: dict):
 
     print(f"\n[{sub_id}] 채점 시작 ({language}, 총 {len(test_cases)}개 테스트케이스, thread={threading.current_thread().name})")
 
-    encoded_code = base64.b64encode(code.encode("utf-8")).decode("utf-8")
-
-    ok, message = compile_check(sub_id, cfg, encoded_code)
+    ok, message = compile_check(sub_id, cfg, code)
     if not ok:
         if is_test:
             r.publish(f"test_result:{sub_id}", json.dumps({
@@ -390,7 +437,7 @@ def _process_submission(task: dict):
     for idx, tc in enumerate(test_cases, 1):
         if is_test and task.get("expires_at", float("inf")) <= time.time():
             return
-        status, actual = run_one_testcase(sub_id, cfg, encoded_code, tc)
+        status, actual = run_one_testcase(sub_id, cfg, code, tc)
 
         test_results.append({
             "id": idx,
