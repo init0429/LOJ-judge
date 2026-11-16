@@ -174,9 +174,12 @@ def _run_container(cfg: dict, command: str, timeout_seconds: float):
             detach=True,
             network_disabled=True,
             mem_limit=cfg["mem_limit"],
+            # 동시 채점끼리 CPU를 나눠 쓰며 실행 시간이 흔들리지 않도록 1코어로 고정
+            nano_cpus=1_000_000_000,
             pids_limit=50,
             user="1000:1000",
             cap_drop=["ALL"],
+            security_opt=["no-new-privileges"],
             read_only=True,
             tmpfs={"/tmp": "rw,exec,nosuid,size=64m,mode=1777"},
             log_config=docker.types.LogConfig(type="none"),

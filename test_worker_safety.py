@@ -93,6 +93,8 @@ class WorkerSafetyTests(unittest.TestCase):
         worker.docker.types.LogConfig.assert_called_once_with(type="none")
         options = worker.client.containers.create.call_args.kwargs
         self.assertTrue(options["read_only"])
+        self.assertEqual(options["nano_cpus"], 1_000_000_000)
+        self.assertEqual(options["security_opt"], ["no-new-privileges"])
         self.assertIn("size=64m", options["tmpfs"]["/tmp"])
         self.assertIn("exec", options["tmpfs"]["/tmp"].split(","))
         container.remove.assert_called_once_with(force=True)
