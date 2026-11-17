@@ -169,6 +169,12 @@ MESSAGE_LIMIT = 8192
 # 예제 실행 결과는 Redis를 거쳐 브라우저까지 가므로 입력·출력을 이 길이로 자름
 TEST_FIELD_LIMIT = 16 * 1024
 
+QUEUE = "submission_queue"
+# 꺼내서 채점 중인 작업을 옮겨 두는 목록. 워커가 도중에 죽어도 작업이 사라지지 않는다.
+PROCESSING = "submission_processing"
+# 같은 작업이 워커를 계속 죽이는 경우를 끊기 위한 재시도 한도
+MAX_ATTEMPTS = 3
+
 
 class SandboxResult(NamedTuple):
     exit_code: Optional[int]
@@ -519,6 +525,19 @@ def _clip(text: str) -> str:
     return text[:TEST_FIELD_LIMIT] + "\n… (이하 생략)"
 
 
+def report_failure(task: dict):
+    """채점하지 못한 작업을 System Error로 끝낸다. 대기 중으로 남겨 두지 않기 위함."""
+    sub_id = task.get("submission_id")
+    if sub_id is None:
+        return
+    if task.get("is_test", False):
+        r.publish(f"test_result:{sub_id}", json.dumps({
+            "status": "System Error", "test_cases": [],
+        }))
+    else:
+        update_status(sub_id, "System Error")
+
+
 def process_submission(task: dict):
     try:
         if task.get("is_test") and task.get("expires_at", float("inf")) <= time.time():
@@ -526,15 +545,36 @@ def process_submission(task: dict):
         _process_submission(task)
     except Exception:
         logging.exception("Submission processing failed: %s", task.get("submission_id"))
-        sub_id = task.get("submission_id")
-        if sub_id is None:
+        if task.get("submission_id") is None:
             raise
-        if task.get("is_test", False):
-            r.publish(f"test_result:{sub_id}", json.dumps({
-                "status": "System Error", "test_cases": [],
-            }))
-        else:
-            update_status(sub_id, "System Error")
+        report_failure(task)
+
+
+def recover_interrupted_jobs():
+    """
+    워커가 채점 도중에 죽으면(재배포, OOM, 호스트 재시작) 꺼내 둔 작업이 PROCESSING에
+    남는다. 시작할 때 원래 순서대로 큐 맨 앞에 되돌려서 제출이 "채점 중"에 영원히
+    멈춰 있지 않게 한다. MAX_ATTEMPTS번 되돌아온 작업은 System Error로 끝낸다.
+
+    워커 인스턴스가 하나라고 가정한다. 여러 개를 띄우면 다른 워커가 채점 중인 작업도
+    되돌아가 한 번 더 채점된다(결과는 같으므로 해롭지는 않다).
+    """
+    recovered = 0
+    while (data := r.rpop(PROCESSING)) is not None:
+        try:
+            task = json.loads(data)
+        except ValueError:
+            continue
+        attempts = task.get("attempts", 0) + 1
+        if attempts >= MAX_ATTEMPTS:
+            logging.error("Giving up on %s after %d attempts", task.get("submission_id"), attempts)
+            report_failure(task)
+            continue
+        task["attempts"] = attempts
+        r.lpush(QUEUE, json.dumps(task))
+        recovered += 1
+    if recovered:
+        print(f"중단됐던 작업 {recovered}개를 큐에 되돌렸습니다.")
 
 
 def _process_submission(task: dict):
@@ -633,18 +673,31 @@ def main():
         inflight = 0
         inflight_lock = threading.Lock()
 
-        def on_done(_future):
+        def finish(data):
+            # 끝난 작업만 PROCESSING에서 지운다. 지우지 못하면 다음 시작 때 다시 채점된다.
+            try:
+                r.lrem(PROCESSING, 1, data)
+            except redis.exceptions.RedisError:
+                logging.exception("Failed to acknowledge a finished job")
+
+        def on_done(_future, data):
             nonlocal inflight
             if _future.exception() is not None:
                 logging.error("Judge task failed", exc_info=(
                     type(_future.exception()), _future.exception(),
                     _future.exception().__traceback__,
                 ))
+            finish(data)
             with inflight_lock:
                 inflight -= 1
 
+        recovered = False
         while True:
             try:
+                if not recovered:
+                    recover_interrupted_jobs()
+                    recovered = True
+
                 with inflight_lock:
                     can_pull = inflight < CONCURRENCY
 
@@ -652,15 +705,20 @@ def main():
                     time.sleep(0.05)
                     continue
 
-                result = r.blpop("submission_queue", timeout=2)
+                # 꺼내는 것과 PROCESSING에 적어 두는 것을 한 번에 한다.
+                data = r.blmove(QUEUE, PROCESSING, 2, "LEFT", "RIGHT")
 
-                if result:
-                    _, data = result
-                    task = json.loads(data.decode("utf-8"))
+                if data:
+                    try:
+                        task = json.loads(data)
+                    except ValueError:
+                        logging.error("Dropping a malformed job")
+                        finish(data)
+                        continue
                     with inflight_lock:
                         inflight += 1
                     future = pool.submit(process_submission, task)
-                    future.add_done_callback(on_done)
+                    future.add_done_callback(lambda done, data=data: on_done(done, data))
 
             except redis.exceptions.ConnectionError:
                 print("Redis 연결이 끊어졌습니다. 재연결 시도 중...")

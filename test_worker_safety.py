@@ -302,6 +302,39 @@ class WorkerSafetyTests(unittest.TestCase):
         container.remove.assert_called_once_with(force=True)
 
 
+class QueueRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.worker = load_worker()
+        self.worker.update_status = Mock()
+        self.lists = {self.worker.QUEUE: [], self.worker.PROCESSING: []}
+        self.worker.r.rpop.side_effect = lambda key: self.lists[key].pop() if self.lists[key] else None
+        self.worker.r.lpush.side_effect = lambda key, value: self.lists[key].insert(0, value)
+
+    def job(self, name, **extra):
+        return json.dumps({"submission_id": name, **extra})
+
+    def test_interrupted_jobs_return_to_the_front_in_order(self):
+        self.lists[self.worker.QUEUE] = [self.job("waiting")]
+        self.lists[self.worker.PROCESSING] = [self.job("first"), self.job("second")]
+        self.worker.recover_interrupted_jobs()
+        order = [json.loads(item)["submission_id"] for item in self.lists[self.worker.QUEUE]]
+        self.assertEqual(order, ["first", "second", "waiting"])
+        self.assertEqual(self.lists[self.worker.PROCESSING], [])
+        self.assertEqual(json.loads(self.lists[self.worker.QUEUE][0])["attempts"], 1)
+
+    def test_job_that_keeps_killing_the_worker_is_failed(self):
+        self.lists[self.worker.PROCESSING] = [self.job("poison", attempts=self.worker.MAX_ATTEMPTS - 1)]
+        with self.assertLogs(level="ERROR"):
+            self.worker.recover_interrupted_jobs()
+        self.assertEqual(self.lists[self.worker.QUEUE], [])
+        self.worker.update_status.assert_called_once_with("poison", "System Error")
+
+    def test_malformed_leftovers_are_dropped(self):
+        self.lists[self.worker.PROCESSING] = ["not json"]
+        self.worker.recover_interrupted_jobs()
+        self.assertEqual(self.lists, {self.worker.QUEUE: [], self.worker.PROCESSING: []})
+
+
 class TestRunPayloadTests(unittest.TestCase):
     def test_huge_fields_are_clipped_for_test_runs(self):
         worker = load_worker()
