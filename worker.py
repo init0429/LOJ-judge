@@ -17,9 +17,15 @@ import docker
 import docker.errors
 from supabase import create_client, Client
 
-url: str = os.environ.get("SUPABASE_URL", "")
-key: str = os.environ.get("SUPABASE_KEY", "")
-supabase: Client = create_client(url, key)
+def required_env(name: str) -> str:
+    """빠지면 채점을 하나도 못 하는 설정. 시작할 때 바로 알린다."""
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"환경 변수 {name}가 비어 있습니다. .env를 확인하세요 (.env.example 참고).")
+    return value
+
+
+supabase: Client = create_client(required_env("SUPABASE_URL"), required_env("SUPABASE_KEY"))
 
 redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
 r = redis.from_url(redis_url, health_check_interval=30)

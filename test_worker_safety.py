@@ -40,6 +40,8 @@ def load_worker():
         "urllib3": MagicMock(),
         "urllib3.exceptions": SimpleNamespace(ReadTimeoutError=TimeoutError),
     }
+    os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
+    os.environ.setdefault("SUPABASE_KEY", "test-key")
     spec = importlib.util.spec_from_file_location("worker_under_test", Path(__file__).with_name("worker.py"))
     module = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, stubs):
@@ -324,6 +326,14 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual((worker.CONCURRENCY, worker.COMPILE_MEM_MB), (1, 192))
         self.assertEqual(self.load(2, JUDGE_CONCURRENCY="").CONCURRENCY, 1)
         self.assertEqual(self.load(2).COMPILE_MEM_MB, 320)
+
+
+class RequiredSettingsTests(unittest.TestCase):
+    def test_missing_supabase_settings_stop_the_worker_at_startup(self):
+        for missing in ("SUPABASE_URL", "SUPABASE_KEY"):
+            with self.subTest(missing=missing), patch.dict("os.environ", {missing: "  "}):
+                with self.assertRaisesRegex(RuntimeError, missing):
+                    load_worker()
 
 
 class QueueRecoveryTests(unittest.TestCase):
