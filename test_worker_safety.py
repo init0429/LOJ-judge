@@ -7,6 +7,7 @@ import sys
 import tarfile
 from types import SimpleNamespace
 import unittest
+import unittest.mock
 from unittest.mock import MagicMock, Mock, patch
 
 
@@ -156,10 +157,9 @@ class WorkerSafetyTests(unittest.TestCase):
         worker.LANGUAGES = {"c": C}
         worker.update_status = Mock()
         worker._run_container = Mock(side_effect=[worker.SandboxResult(0, b"ELF")] + [worker.SandboxResult(0, b"3")] * 3)
-        worker._process_submission({
-            "submission_id": "one", "language": "c", "code": "int main(){}",
-            "test_cases": [{"input": "1 2", "output": "3"}] * 3,
-        })
+        worker.load_problem = Mock(return_value=({}, [{"input": "1 2", "output": "3"}] * 3))
+        worker._process_submission({"submission_id": "one", "problem_id": 7, "language": "c", "code": "int main(){}"})
+        worker.load_problem.assert_called_once_with(7, public_only=False)
         commands = [call.args[1] for call in worker._run_container.call_args_list]
         self.assertEqual([C["compile"] in command for command in commands], [True, False, False, False])
         self.assertTrue(commands[0].endswith("1>&2 && cat /tmp/main"))
@@ -167,6 +167,37 @@ class WorkerSafetyTests(unittest.TestCase):
         self.assertEqual(compile_options["mem_limit"], worker.COMPILE_MEM_LIMIT)
         self.assertEqual(compile_options["timeout"], worker.COMPILE_TIMEOUT)
         worker.update_status.assert_called_with("one", "Accepted")
+
+    def test_test_cases_come_from_the_database_not_the_queue(self):
+        worker = load_worker()
+        query = worker.supabase.table.return_value
+        for method in ("select", "eq", "order"):
+            getattr(query, method).return_value = query
+        query.execute.side_effect = [
+            SimpleNamespace(data=[{"time_limit_ms": 1000, "memory_limit_mb": 256}]),
+            SimpleNamespace(data=[{"input_data": "1 2", "expected_output": "3"}, {"input_data": None, "expected_output": "0"}]),
+        ]
+        problem, cases = worker.load_problem(7, public_only=True)
+        self.assertEqual(problem, {"time_limit_ms": 1000, "memory_limit_mb": 256})
+        self.assertEqual(cases, [{"input": "1 2", "output": "3"}, {"input": "", "output": "0"}])
+        query.eq.assert_any_call("is_hidden", False)
+
+    def test_hidden_cases_are_included_for_submissions(self):
+        worker = load_worker()
+        query = worker.supabase.table.return_value
+        for method in ("select", "eq", "order"):
+            getattr(query, method).return_value = query
+        query.execute.side_effect = [SimpleNamespace(data=[{}]), SimpleNamespace(data=[])]
+        worker.load_problem(7, public_only=False)
+        self.assertNotIn(unittest.mock.call("is_hidden", False), query.eq.call_args_list)
+
+    def test_missing_problem_is_reported_as_a_system_error(self):
+        worker = load_worker()
+        worker.supabase.table.return_value.select.return_value.eq.return_value.execute.return_value = SimpleNamespace(data=[])
+        worker.update_status = Mock()
+        with self.assertLogs(level="ERROR"):
+            worker.process_submission({"submission_id": "one", "problem_id": 7, "language": "python", "code": "print(1)"})
+        worker.update_status.assert_called_with("one", "System Error")
 
     def test_interpreted_languages_ship_the_source_as_is(self):
         worker = load_worker()

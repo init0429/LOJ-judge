@@ -184,6 +184,38 @@ def _bundle(files: dict) -> bytes:
     return buffer.getvalue()
 
 
+def load_problem(problem_id, public_only: bool):
+    """
+    문제의 제한과 테스트케이스를 DB에서 읽는다.
+    큐에는 제출 정보만 싣고 테스트 데이터는 여기서 직접 가져오므로, 테스트 데이터가
+    큰 문제도 큐 용량 제한에 걸리지 않는다. public_only면 공개 예제만 읽는다(예제 실행).
+
+    반환값: (problem: dict, test_cases: [{"input", "output"}])
+    """
+    problem = (
+        supabase.table("problems")
+        .select("time_limit_ms, memory_limit_mb")
+        .eq("id", problem_id)
+        .execute()
+    )
+    if not problem.data:
+        raise LookupError(f"Problem {problem_id} does not exist")
+
+    query = (
+        supabase.table("test_cases")
+        .select("input_data, expected_output")
+        .eq("problem_id", problem_id)
+    )
+    if public_only:
+        query = query.eq("is_hidden", False)
+    rows = query.order("id").execute().data or []
+    test_cases = [
+        {"input": row["input_data"] or "", "output": row["expected_output"] or ""}
+        for row in rows
+    ]
+    return problem.data[0], test_cases
+
+
 def update_status(sub_id: str, status: str):
     try:
         supabase.table("submissions").update({"status": status}).eq("id", sub_id).execute()
@@ -431,7 +463,6 @@ def _process_submission(task: dict):
     sub_id = task["submission_id"]
     code = task["code"]
     language = task["language"]
-    test_cases = task.get("test_cases", [])
     is_test = task.get("is_test", False)
 
     cfg = LANGUAGES.get(language)
@@ -445,6 +476,8 @@ def _process_submission(task: dict):
         else:
             update_status(sub_id, "System Error")
         return
+
+    _problem, test_cases = load_problem(task["problem_id"], public_only=is_test)
 
     if not test_cases:
         print(f"[{sub_id}] 테스트케이스 없음. 건너뜀.")
