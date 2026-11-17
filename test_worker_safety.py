@@ -302,5 +302,20 @@ class WorkerSafetyTests(unittest.TestCase):
         container.remove.assert_called_once_with(force=True)
 
 
+class TestRunPayloadTests(unittest.TestCase):
+    def test_huge_fields_are_clipped_for_test_runs(self):
+        worker = load_worker()
+        worker.LANGUAGES = {"python": PYTHON}
+        big = "9" * (worker.TEST_FIELD_LIMIT * 4)
+        worker.load_problem = Mock(return_value=({}, [{"input": big, "output": big}]))
+        worker._run_container = Mock(return_value=worker.SandboxResult(0, b"1", elapsed=0.1))
+        worker._process_submission({"submission_id": "t", "problem_id": 1, "language": "python", "code": "print(1)", "is_test": True})
+        payload = worker.r.publish.call_args.args[1]
+        result = json.loads(payload)
+        self.assertEqual(result["status"], "Wrong Answer")
+        self.assertLess(len(payload), worker.TEST_FIELD_LIMIT * 8)
+        self.assertTrue(result["test_cases"][0]["input"].endswith("(이하 생략)"))
+
+
 if __name__ == "__main__":
     unittest.main()

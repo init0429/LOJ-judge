@@ -166,6 +166,8 @@ COMPILE_TIMEOUT = 30.0
 COMPILE_MEM_MB = 512
 ARTIFACT_LIMIT = 16 * 1024 * 1024
 MESSAGE_LIMIT = 8192
+# 예제 실행 결과는 Redis를 거쳐 브라우저까지 가므로 입력·출력을 이 길이로 자름
+TEST_FIELD_LIMIT = 16 * 1024
 
 
 class SandboxResult(NamedTuple):
@@ -511,6 +513,12 @@ def run_one_testcase(sub_id: str, cfg: dict, program: dict, tc: dict,
         return "Wrong Answer", logs
 
 
+def _clip(text: str) -> str:
+    if len(text) <= TEST_FIELD_LIMIT:
+        return text
+    return text[:TEST_FIELD_LIMIT] + "\n… (이하 생략)"
+
+
 def process_submission(task: dict):
     try:
         if task.get("is_test") and task.get("expires_at", float("inf")) <= time.time():
@@ -585,9 +593,9 @@ def _process_submission(task: dict):
         test_results.append({
             "id": idx,
             "status": status,
-            "input": tc["input"],
-            "expected": tc["output"],
-            "actual": actual,
+            "input": _clip(tc["input"]) if is_test else "",
+            "expected": _clip(tc["output"]) if is_test else "",
+            "actual": _clip(actual) if is_test else "",
         })
 
         if status != "Accepted":
