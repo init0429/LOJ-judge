@@ -56,6 +56,21 @@ client = docker.from_env()
 NATIVE = {"time_factor": 1, "time_extra": 0.0, "mem_extra": 16}
 SCRIPT = {"time_factor": 3, "time_extra": 2.0, "mem_extra": 32}
 
+# MySQL은 테스트케이스마다 샌드박스 안에서 서버를 새로 띄웠다가 버린다. 제출끼리 DB를
+# 공유하지 않으므로 다른 사람의 테이블을 보거나 망가뜨릴 수 없다. 버퍼와 스레드를 최소로
+# 줄여 서버 하나가 메모리 약 110MB, 스레드 약 25개(샌드박스 pids_limit 50 안쪽)를 쓴다.
+MYSQLD = (
+    "mysqld --no-defaults --datadir=/tmp/db --socket=/tmp/mysql.sock"
+    " --pid-file=/tmp/mysql.pid --log-error=/tmp/mysql.err --tmpdir=/tmp"
+    " --skip-networking --mysqlx=OFF --performance-schema=OFF --skip-log-bin"
+    " --skip-name-resolve --innodb-buffer-pool-size=8M --innodb-log-buffer-size=1M"
+    " --innodb-redo-log-capacity=8M --innodb-data-file-path=ibdata1:12M:autoextend"
+    " --innodb-autoextend-increment=1 --innodb-read-io-threads=1 --innodb-write-io-threads=1"
+    " --innodb-purge-threads=1 --innodb-page-cleaners=1 --innodb-doublewrite=OFF"
+    " --innodb-flush-log-at-trx-commit=0 --innodb-use-native-aio=OFF --innodb-flush-method=nosync"
+)
+MYSQL = "mysql -uroot -S /tmp/mysql.sock"
+
 LANGUAGES = {
     "javascript": {
         "image": "node:24-alpine",
@@ -153,6 +168,38 @@ LANGUAGES = {
             "\""
         ),
         **SCRIPT,
+    },
+    "mysql": {
+        # sql과 같은 방식: 테스트케이스의 input은 셋업 스크립트(CREATE TABLE/INSERT),
+        # 학생의 코드는 쿼리. 문장을 여러 개 써도 되고, 결과를 내는 문장마다 행을 출력한다.
+        # 출력도 sql과 같은 모양(열 이름 없이 열을 |로 이어 붙임)이라 같은 문제에 둘 다 쓸 수 있다.
+        # 단 NULL은 sql이 None, mysql이 NULL로 찍는다.
+        "image": "mysql:8.4",
+        "filename": "main.sql",
+        "compile": None,
+        # 빈 데이터 디렉터리를 만드는 데 몇 초 걸리므로 워커가 한 번만 만들어 두고(prepare)
+        # 테스트케이스마다 압축본(prepared)을 넣어 준다. 그러면 서버는 0.3초 남짓에 뜬다.
+        "prepare": (
+            f"{MYSQLD} --initialize-insecure 1>&2 || {{ cat /tmp/mysql.err >&2; exit 1; }};"
+            " tar -czf - -C /tmp db"
+        ),
+        "prepared": "db.tgz",
+        # 표준입력(셋업 스크립트)은 judge DB에 그대로 넣고, 학생 쿼리의 결과는 탭 대신 |로 잇는다.
+        # 서버가 뜨다가 죽으면 기다리지 않고 서버 로그를 남기고 끝낸다.
+        "run": (
+            "{ tar -xzf /tmp/db.tgz -C /tmp && rm /tmp/db.tgz || exit 1;"
+            f" {MYSQLD} </dev/null >/dev/null 2>&1 & pid=$!;"
+            " until mysqladmin -uroot -S /tmp/mysql.sock ping >/dev/null 2>&1; do"
+            " kill -0 $pid 2>/dev/null || { cat /tmp/mysql.err >&2; exit 1; }; sleep 0.02; done;"
+            f" {MYSQL} -e 'CREATE DATABASE judge' && {MYSQL} judge"
+            f" && {MYSQL} -N -B -r judge < /tmp/main.sql > /tmp/out && tr '\\t' '|' < /tmp/out; }}"
+        ),
+        # 서버를 띄우는 시간(빠른 서버 0.7초, 느린 서버 몇 초)이 실행 시간에 섞이므로 넉넉히
+        "time_factor": 1,
+        "time_extra": 5.0,
+        # 서버 자체 약 110MB + /tmp에 푼 데이터 디렉터리 약 100MB
+        "mem_extra": 256,
+        "tmpfs_mb": 192,
     },
 }
 
@@ -318,13 +365,23 @@ def pull_images_on_startup():
                 print(f"[startup] {lang} 이미지 준비 완료: {image}")
             except Exception as e:
                 print(f"[startup] {lang} 이미지 pull 실패 ({image}): {e}")
+                continue
+        if cfg.get("prepare"):
+            # 첫 제출이 준비 시간(몇 초)을 기다리지 않게 미리 만든다. 실패하면 첫 제출 때 다시 시도.
+            try:
+                prepared_file(cfg)
+                print(f"[startup] {lang} 준비 완료")
+            except Exception as e:
+                print(f"[startup] {lang} 준비 실패: {e}")
 
 
 def _run_container(image: str, command: str, files: dict, *, mem_mb: int,
-                   timeout: float, output_limit: int = OUTPUT_LIMIT) -> SandboxResult:
+                   timeout: float, output_limit: int = OUTPUT_LIMIT,
+                   tmpfs_mb: int = 64) -> SandboxResult:
     """
     공통 컨테이너 실행 헬퍼.
     files는 실행 전에 /tmp에 풀리는 {파일명: bytes} (command가 UNPACK으로 시작해야 함)
+    tmpfs_mb는 /tmp 크기. /tmp는 메모리에 있으므로 쓴 만큼 mem_mb에서 빠진다.
     """
     container = None
     stream = None
@@ -354,7 +411,7 @@ def _run_container(image: str, command: str, files: dict, *, mem_mb: int,
             cap_drop=["ALL"],
             security_opt=["no-new-privileges"],
             read_only=True,
-            tmpfs={"/tmp": "rw,exec,nosuid,size=64m,mode=1777"},
+            tmpfs={"/tmp": f"rw,exec,nosuid,size={tmpfs_mb}m,mode=1777"},
             log_config=docker.types.LogConfig(type="none"),
             working_dir="/tmp",
         )
@@ -445,6 +502,32 @@ def _run_container(image: str, command: str, files: dict, *, mem_mb: int,
                 thread.join(timeout=5)
 
 
+PREPARE_TIMEOUT = 120.0
+PREPARE_MEM_MB = 512
+_prepared: dict = {}
+_prepare_lock = threading.Lock()
+
+
+def prepared_file(cfg: dict) -> bytes:
+    """
+    제출과 상관없이 언어마다 한 번만 만들면 되는 파일(cfg["prepare"]의 표준출력)을 돌려준다.
+    처음 부를 때 만들어 워커가 끝날 때까지 쓰고, 실패하면 저장하지 않아 다음에 다시 만든다.
+    """
+    with _prepare_lock:
+        if cfg["prepare"] in _prepared:
+            return _prepared[cfg["prepare"]]
+        result = _run_container(
+            cfg["image"], f"{UNPACK} && {cfg['prepare']}", {},
+            mem_mb=PREPARE_MEM_MB, timeout=PREPARE_TIMEOUT,
+            output_limit=ARTIFACT_LIMIT, tmpfs_mb=cfg.get("tmpfs_mb", 64),
+        )
+        if result.timed_out or result.overflow or result.exit_code != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()[-2000:]
+            raise RuntimeError(f"Preparing {cfg['image']} failed: {detail}")
+        _prepared[cfg["prepare"]] = result.stdout
+        return result.stdout
+
+
 def build_program(sub_id: str, cfg: dict, code: str):
     """
     실행 컨테이너에 넣을 프로그램 파일을 준비한다.
@@ -455,6 +538,8 @@ def build_program(sub_id: str, cfg: dict, code: str):
     반환값: (files: dict | None, message: str) — 컴파일 실패 시 files는 None
     """
     source = {cfg["filename"]: code.encode("utf-8")}
+    if cfg.get("prepare"):
+        source[cfg["prepared"]] = prepared_file(cfg)
     if cfg["compile"] is None:
         return source, ""
 
@@ -500,6 +585,7 @@ def run_one_testcase(sub_id: str, cfg: dict, program: dict, tc: dict,
             cfg["image"], command, files,
             mem_mb=memory_mb + cfg["mem_extra"] + bundle_mb,
             timeout=time_limit + TIME_GRACE,
+            tmpfs_mb=cfg.get("tmpfs_mb", 64),
         )
     except docker.errors.ImageNotFound:
         print(f"[{sub_id}] Docker 이미지 없음: {cfg['image']}")

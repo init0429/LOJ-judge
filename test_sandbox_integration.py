@@ -67,6 +67,32 @@ class SandboxIntegrationTests(unittest.TestCase):
         case = {"input": "CREATE TABLE t(a,b);INSERT INTO t VALUES(1,'x'),(2,'y');", "output": "2|y\n1|x"}
         self.assertEqual(self.judge("sql", "SELECT a,b FROM t ORDER BY a DESC", [case])[0], "Accepted")
 
+    MYSQL_SETUP = "CREATE TABLE t(a INT, b VARCHAR(9));\nINSERT INTO t VALUES (1,'x'),(2,NULL);"
+
+    def test_mysql_runs_the_query_against_the_setup_script(self):
+        # 여러 문장, MySQL 전용 함수, NULL 표기, sql과 같은 | 구분자
+        case = {"input": self.MYSQL_SETUP, "output": "2|NULL|2026/01\n1|x|2026/01"}
+        code = "SET @f := '%Y/%m';\nSELECT a, b, DATE_FORMAT('2026-01-02', @f) FROM t ORDER BY a DESC;"
+        self.assertEqual(self.judge("mysql", code, [case]), ("Accepted", ""))
+
+    def test_mysql_verdicts(self):
+        case = {"input": self.MYSQL_SETUP, "output": "1"}
+        self.assertEqual(self.judge("mysql", "SELECT 2;", [case])[0], "Wrong Answer")
+        status, message = self.judge("mysql", "SELEC 1;", [case])
+        self.assertEqual(status, "Runtime Error")
+        self.assertIn("ERROR 1064", message)
+        self.assertEqual(self.judge("mysql", "SELECT SLEEP(30);", [case], {"time_limit_ms": 500})[0], "Time Limit Exceeded")
+
+    def test_mysql_runs_each_case_on_a_fresh_database(self):
+        # 앞 테스트케이스에서 넣은 행이 다음 테스트케이스에 남지 않는다.
+        case = {"input": self.MYSQL_SETUP, "output": "3"}
+        code = "INSERT INTO t VALUES (3, 'z');\nSELECT COUNT(*) FROM t;"
+        self.assertEqual(self.judge("mysql", code, [case, case]), ("Accepted", ""))
+
+    def test_mysql_solution_fits_the_smallest_memory_limit(self):
+        case = {"input": self.MYSQL_SETUP, "output": "2"}
+        self.assertEqual(self.judge("mysql", "SELECT COUNT(*) FROM t;", [case], {"memory_limit_mb": 16})[0], "Accepted")
+
     def test_verdicts(self):
         case = {"input": "1 2", "output": "3"}
         self.assertEqual(self.judge("python", "print(4)", [case])[0], "Wrong Answer")

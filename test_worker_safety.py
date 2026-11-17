@@ -162,9 +162,29 @@ class WorkerSafetyTests(unittest.TestCase):
         image, command, files = worker._run_container.call_args.args
         self.assertEqual(command, f"{worker.UNPACK} && /tmp/main < /tmp/.stdin")
         self.assertEqual(files, {"main": b"ELF", ".stdin": b"1 2"})
-        # 256MB 제한 + 런타임 몫 16MB + tmpfs에 풀리는 묶음 1MB, 제한 1초 + 여유
+        # 256MB 제한 + 런타임 몫 16MB + tmpfs에 풀리는 묶음 1MB, 제한 1초 + 여유, 기본 /tmp 크기
         self.assertEqual(worker._run_container.call_args.kwargs,
-                         {"mem_mb": 256 + 16 + 1, "timeout": 1.0 + worker.TIME_GRACE})
+                         {"mem_mb": 256 + 16 + 1, "timeout": 1.0 + worker.TIME_GRACE, "tmpfs_mb": 64})
+
+    def test_prepared_file_is_built_once_and_shipped_with_the_source(self):
+        worker = load_worker()
+        cfg = worker.LANGUAGES["mysql"]
+        worker._run_container = Mock(return_value=worker.SandboxResult(0, b"DATADIR"))
+        for _ in range(2):
+            files, _message = worker.build_program("one", cfg, "SELECT 1;")
+            self.assertEqual(files, {"main.sql": b"SELECT 1;", "db.tgz": b"DATADIR"})
+        self.assertEqual(worker._run_container.call_count, 1)
+
+    def test_failed_preparation_is_retried_next_time(self):
+        worker = load_worker()
+        cfg = worker.LANGUAGES["mysql"]
+        worker._run_container = Mock(side_effect=[
+            worker.SandboxResult(1, stderr=b"init failed"),
+            worker.SandboxResult(0, b"DATADIR"),
+        ])
+        with self.assertRaisesRegex(RuntimeError, "init failed"):
+            worker.prepared_file(cfg)
+        self.assertEqual(worker.prepared_file(cfg), b"DATADIR")
 
     def test_problem_limits_are_scaled_per_language(self):
         worker = load_worker()
