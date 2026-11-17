@@ -24,8 +24,15 @@ supabase: Client = create_client(url, key)
 redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
 r = redis.from_url(redis_url, health_check_interval=30)
 
-# 채점 동시 실행 개수. 컨테이너 스펙(CPU/메모리)에 맞게 조절
-CONCURRENCY = int(os.getenv("JUDGE_CONCURRENCY", "4"))
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    value = os.getenv(name, "").strip()
+    return max(minimum, int(value)) if value else default
+
+
+# 채점 동시 실행 개수. 샌드박스 하나가 CPU 1코어를 쓰므로, 지정하지 않으면 API와 Redis 몫으로
+# 한 코어를 남기고 나머지만큼 돌린다 (2코어 서버면 1개). 코어보다 많이 돌리면 실행 시간이
+# 늘어나 맞는 풀이가 시간 초과될 수 있다.
+CONCURRENCY = _env_int("JUDGE_CONCURRENCY", max(1, (os.cpu_count() or 2) - 1))
 
 # docker-py 클라이언트는 스레드 간 공유해도 안전 (매 호출이 독립적인 HTTP 요청)
 client = docker.from_env()
@@ -161,9 +168,10 @@ UNPACK = f"tar -xf - -C /tmp || {{ echo {BUNDLE_FAILED} >&2; exit 125; }}"
 STDIN_FILE = ".stdin"
 
 OUTPUT_LIMIT = 1024 * 1024
-# 컴파일러는 실행 제한과 무관하게 넉넉히 줌 (g++로 <bits/stdc++.h>를 -O2 컴파일하면 수백 MB를 씀)
+# 컴파일러는 실행 제한과 무관하게 따로 줌. g++로 <bits/stdc++.h>를 -O2 컴파일하면 약 190MB를 쓴다.
+# 메모리가 작은 서버에서는 동시 채점 수 × 이 값이 남는 메모리를 넘지 않게 맞출 것.
 COMPILE_TIMEOUT = 30.0
-COMPILE_MEM_MB = 512
+COMPILE_MEM_MB = _env_int("JUDGE_COMPILE_MEMORY_MB", 320, minimum=192)
 ARTIFACT_LIMIT = 16 * 1024 * 1024
 MESSAGE_LIMIT = 8192
 # 예제 실행 결과는 Redis를 거쳐 브라우저까지 가므로 입력·출력을 이 길이로 자름

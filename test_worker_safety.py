@@ -2,6 +2,7 @@
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tarfile
@@ -300,6 +301,29 @@ class WorkerSafetyTests(unittest.TestCase):
             result = run(worker)
         self.assertEqual(result, worker.SandboxResult(None, timed_out=True))
         container.remove.assert_called_once_with(force=True)
+
+
+class SettingsTests(unittest.TestCase):
+    def load(self, cpus, **env):
+        with patch.dict("os.environ", env, clear=False), patch("os.cpu_count", return_value=cpus):
+            for name in ("JUDGE_CONCURRENCY", "JUDGE_COMPILE_MEMORY_MB"):
+                if name not in env:
+                    os.environ.pop(name, None)
+            return load_worker()
+
+    def test_concurrency_leaves_a_core_for_the_rest_of_the_stack(self):
+        self.assertEqual(self.load(2).CONCURRENCY, 1)
+        self.assertEqual(self.load(1).CONCURRENCY, 1)
+        self.assertEqual(self.load(8).CONCURRENCY, 7)
+        self.assertEqual(self.load(None).CONCURRENCY, 1)
+
+    def test_settings_can_be_overridden_but_not_below_a_floor(self):
+        worker = self.load(2, JUDGE_CONCURRENCY="3", JUDGE_COMPILE_MEMORY_MB="512")
+        self.assertEqual((worker.CONCURRENCY, worker.COMPILE_MEM_MB), (3, 512))
+        worker = self.load(2, JUDGE_CONCURRENCY="0", JUDGE_COMPILE_MEMORY_MB="64")
+        self.assertEqual((worker.CONCURRENCY, worker.COMPILE_MEM_MB), (1, 192))
+        self.assertEqual(self.load(2, JUDGE_CONCURRENCY="").CONCURRENCY, 1)
+        self.assertEqual(self.load(2).COMPILE_MEM_MB, 320)
 
 
 class QueueRecoveryTests(unittest.TestCase):
