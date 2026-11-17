@@ -262,6 +262,17 @@ def _run_stats(container, fallback: float):
         return fallback, False
 
 
+def outputs_match(actual: str, expected: str) -> bool:
+    """
+    출력 비교. 앞뒤 빈 줄과 각 줄 끝의 공백(\r 포함)은 무시한다.
+    줄 끝 공백 하나나 윈도우식 줄바꿈 때문에 맞는 풀이가 오답이 되지 않게 하기 위함.
+    """
+    def lines(text: str):
+        return [line.rstrip() for line in text.strip().split("\n")]
+
+    return lines(actual) == lines(expected)
+
+
 def update_status(sub_id: str, status: str):
     try:
         supabase.table("submissions").update({"status": status}).eq("id", sub_id).execute()
@@ -492,7 +503,7 @@ def run_one_testcase(sub_id: str, cfg: dict, program: dict, tc: dict,
         print(f"[{sub_id}] Testcase: 런타임 에러 (exit code {result.exit_code})\n{logs[:4096]}")
         return "Runtime Error", logs
 
-    if logs == expected_output.strip():
+    if outputs_match(logs, expected_output):
         print(f"[{sub_id}] Testcase: 통과 ✓")
         return "Accepted", logs
     else:

@@ -197,6 +197,15 @@ class WorkerSafetyTests(unittest.TestCase):
             worker._run_container = Mock(return_value=result)
             self.assertEqual(worker.run_one_testcase("one", C, {"main": b"ELF"}, CASE, 1.0, 128)[0], expected)
 
+    def test_trailing_whitespace_and_line_endings_do_not_fail_an_answer(self):
+        worker = load_worker()
+        same = [("1 2 3 \n4\n", "1 2 3\n4"), ("a\r\nb\r\n", "a\nb"), ("\n\n3\n\n", "3"), ("x\t\ny", "x\ny\n")]
+        different = [("1  2", "1 2"), (" 1\n2", "1\n 2"), ("1\n\n2", "1\n2"), ("3", "3\n4")]
+        for actual, expected in same:
+            self.assertTrue(worker.outputs_match(actual, expected), (actual, expected))
+        for actual, expected in different:
+            self.assertFalse(worker.outputs_match(actual, expected), (actual, expected))
+
     def test_run_time_falls_back_to_the_worker_clock(self):
         worker = load_worker()
         container = Mock()
