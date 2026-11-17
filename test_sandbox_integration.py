@@ -36,13 +36,14 @@ class SandboxIntegrationTests(unittest.TestCase):
         cls.worker = load_worker()
         cls.worker.pull_images_on_startup()
 
-    def judge(self, language, code, cases):
+    def judge(self, language, code, cases, problem=None):
         cfg = self.worker.LANGUAGES[language]
+        time_limit, memory_mb = self.worker.run_limits(cfg, problem or {})
         program, message = self.worker.build_program("test", cfg, code)
         if program is None:
             return "Compile Error", message
         for case in cases:
-            status, actual = self.worker.run_one_testcase("test", cfg, program, case)
+            status, actual = self.worker.run_one_testcase("test", cfg, program, case, time_limit, memory_mb)
             if status != "Accepted":
                 return status, actual
         return "Accepted", ""
@@ -72,6 +73,31 @@ class SandboxIntegrationTests(unittest.TestCase):
         self.assertEqual(self.judge("python", "raise SystemExit(3)", [case])[0], "Runtime Error")
         self.assertEqual(self.judge("python", "while True: pass", [case])[0], "Time Limit Exceeded")
         self.assertEqual(self.judge("c", "int main(void){return x;}", [case])[0], "Compile Error")
+
+    def test_problem_time_limit_is_enforced(self):
+        case = {"input": "", "output": "done"}
+        slow = "#include <stdio.h>\n#include <unistd.h>\nint main(void){usleep(1500000);puts(\"done\");return 0;}"
+        self.assertEqual(self.judge("c", slow, [case], {"time_limit_ms": 1000})[0], "Time Limit Exceeded")
+        self.assertEqual(self.judge("c", slow, [case], {"time_limit_ms": 3000})[0], "Accepted")
+
+    def test_compile_time_does_not_count_against_the_run(self):
+        # 템플릿이 많은 헤더는 컴파일에만 몇 초가 걸린다. 실행 제한은 0.5초.
+        case = {"input": "1 2", "output": "3"}
+        self.assertEqual(self.judge("cpp", SUM["cpp"], [case], {"time_limit_ms": 500})[0], "Accepted")
+
+    def test_problem_memory_limit_is_enforced(self):
+        case = {"input": "", "output": "ok"}
+        # volatile로 써야 -O2가 쓰이지 않는 할당을 지워 버리지 않는다.
+        hog = "#include <stdio.h>\n#include <stdlib.h>\nint main(void){size_t n=200u<<20;volatile char*p=malloc(n);if(!p)return 1;for(size_t i=0;i<n;i+=1024)p[i]=1;puts(\"ok\");return 0;}"
+        self.assertEqual(self.judge("c", hog, [case], {"memory_limit_mb": 64}), ("Runtime Error", "Memory limit exceeded"))
+        self.assertEqual(self.judge("c", hog, [case], {"memory_limit_mb": 512})[0], "Accepted")
+
+    def test_runtime_overhead_is_not_charged_to_the_solution(self):
+        # 제한이 가장 작은 16MB여도 각 언어의 가장 단순한 풀이는 돌아야 한다.
+        case = {"input": "1 2", "output": "3"}
+        for language in ("python", "java", "javascript", "ruby", "php", "perl"):
+            with self.subTest(language=language):
+                self.assertEqual(self.judge(language, SUM[language], [case], {"memory_limit_mb": 16})[0], "Accepted")
 
     def test_sandbox_blocks_network_and_root(self):
         code = "import os,socket\nprint(os.getuid())\ntry:\n    socket.create_connection(('1.1.1.1',53),2)\n    print('online')\nexcept OSError:\n    print('offline')"

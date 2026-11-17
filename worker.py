@@ -10,6 +10,7 @@ import logging
 from requests.exceptions import ReadTimeout, ConnectionError as RequestsConnectionError
 from urllib3.exceptions import ReadTimeoutError
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import NamedTuple, Optional
 
 import docker
@@ -34,57 +35,59 @@ client = docker.from_env()
 # - compile: 컴파일 명령. 인터프리터 언어는 None
 # - artifact: 컴파일 결과물 파일명. 컴파일은 제출당 한 번만 하고, 이 파일 하나를
 #   테스트케이스마다 실행 컨테이너로 넘겨 재사용함
-# - run: 실행 명령 (표준입력은 파이프로 붙음)
-# - mem_limit / timeout: 언어별로 다르게 줄 필요가 있어 개별 지정 (예: JVM은 기본보다 더 필요)
+# - run: 실행 명령 (표준입력은 파이프로 붙음). {mem}은 문제의 메모리 제한(MB)으로 바뀜
+# - time_factor / time_extra: 문제의 시간 제한에 곱하고 더하는 언어별 보정.
+#   실행 시간 = 제한 × time_factor + time_extra(초). 인터프리터와 JVM은 기동과 실행이
+#   느리므로 같은 풀이가 언어 때문에 시간 초과되지 않게 여유를 줌
+# - mem_extra: 런타임 자체가 쓰는 메모리(MB). 컨테이너 제한 = 문제 제한 + mem_extra
+NATIVE = {"time_factor": 1, "time_extra": 0.0, "mem_extra": 16}
+SCRIPT = {"time_factor": 3, "time_extra": 2.0, "mem_extra": 32}
+
 LANGUAGES = {
     "javascript": {
         "image": "node:24-alpine",
         "filename": "main.js",
         "compile": None,
-        "run": "node --max-old-space-size=96 /tmp/main.js",
-        "mem_limit": "256m",
-        "timeout": 5.0,
+        "run": "node --max-old-space-size={mem} /tmp/main.js",
+        **SCRIPT,
+        "mem_extra": 128,
     },
     "typescript": {
         "image": "node:24-alpine",
         "filename": "main.ts",
         "compile": None,
         # Native type stripping supports erasable syntax, not tsc or npm packages.
-        "run": "node --max-old-space-size=96 /tmp/main.ts",
-        "mem_limit": "256m",
-        "timeout": 5.0,
+        "run": "node --max-old-space-size={mem} /tmp/main.ts",
+        **SCRIPT,
+        "mem_extra": 128,
     },
     "ruby": {
         "image": "ruby:3.4-alpine",
         "filename": "main.rb",
         "compile": None,
         "run": "ruby /tmp/main.rb",
-        "mem_limit": "128m",
-        "timeout": 5.0,
+        **SCRIPT,
     },
     "php": {
         "image": "php:8.4-cli-alpine",
         "filename": "main.php",
         "compile": None,
-        "run": "php -d memory_limit=96M /tmp/main.php",
-        "mem_limit": "128m",
-        "timeout": 5.0,
+        "run": "php -d memory_limit={mem}M /tmp/main.php",
+        **SCRIPT,
     },
     "perl": {
         "image": "perl:5.40-slim",
         "filename": "main.pl",
         "compile": None,
         "run": "perl /tmp/main.pl",
-        "mem_limit": "128m",
-        "timeout": 5.0,
+        **SCRIPT,
     },
     "python": {
         "image": "python:3.11-alpine",
         "filename": "main.py",
         "compile": None,
         "run": "python3 /tmp/main.py",
-        "mem_limit": "128m",
-        "timeout": 5.0,
+        **SCRIPT,
     },
     "c": {
         "image": "gcc:13",
@@ -92,8 +95,7 @@ LANGUAGES = {
         "compile": "gcc -O2 -std=c11 -o /tmp/main /tmp/main.c",
         "artifact": "main",
         "run": "/tmp/main",
-        "mem_limit": "128m",
-        "timeout": 5.0,
+        **NATIVE,
     },
     "cpp": {
         "image": "gcc:13",
@@ -101,8 +103,7 @@ LANGUAGES = {
         "compile": "g++ -O2 -std=c++17 -o /tmp/main /tmp/main.cpp",
         "artifact": "main",
         "run": "/tmp/main",
-        "mem_limit": "128m",
-        "timeout": 5.0,
+        **NATIVE,
     },
     "java": {
         "image": "eclipse-temurin:17-jdk-alpine",
@@ -113,10 +114,11 @@ LANGUAGES = {
             " && jar cf /tmp/main.jar -C /tmp/classes ."
         ),
         "artifact": "main.jar",
-        "run": "java -cp /tmp/main.jar -Xmx192m Main",
-        # JVM 자체 오버헤드가 있어서 python/cpp보다 여유를 더 줌.
-        "mem_limit": "256m",
-        "timeout": 8.0,
+        "run": "java -cp /tmp/main.jar -Xmx{mem}m Main",
+        # 힙(-Xmx) 밖에서 JVM이 쓰는 메타스페이스·코드 캐시·스레드 스택 몫
+        "time_factor": 2,
+        "time_extra": 1.0,
+        "mem_extra": 128,
     },
     "sql": {
         # 전용 SQL 문제 UI(스키마/시드 데이터 입력 등)는 아직 없어서 임시로:
@@ -137,10 +139,18 @@ LANGUAGES = {
             "[print('|'.join(str(c) for c in row)) for row in cur.fetchall()]"
             "\""
         ),
-        "mem_limit": "128m",
-        "timeout": 5.0,
+        **SCRIPT,
     },
 }
+
+# 문제에 제한이 비어 있을 때 쓰는 값과, 잘못 등록된 값이 채점 서버를 붙잡지 못하게 하는 범위
+DEFAULT_TIME_LIMIT_MS = 2000
+DEFAULT_MEMORY_LIMIT_MB = 128
+TIME_LIMIT_RANGE_MS = (100, 30_000)
+MEMORY_LIMIT_RANGE_MB = (16, 2048)
+# 시간 제한을 넘겼는지는 컨테이너가 기록한 실행 시간으로 판정하고, 이만큼 더 기다린 뒤에
+# 강제로 끝냄 (Docker API 왕복 시간 때문에 제한 직전에 끝난 풀이를 죽이지 않기 위함)
+TIME_GRACE = 1.0
 
 
 # 소스코드와 입력은 tar 묶음으로 만들어 컨테이너 stdin에 흘려보내고 /tmp에 풀어서 씀.
@@ -153,7 +163,7 @@ STDIN_FILE = ".stdin"
 OUTPUT_LIMIT = 1024 * 1024
 # 컴파일러는 실행 제한과 무관하게 넉넉히 줌 (g++로 <bits/stdc++.h>를 -O2 컴파일하면 수백 MB를 씀)
 COMPILE_TIMEOUT = 30.0
-COMPILE_MEM_LIMIT = "512m"
+COMPILE_MEM_MB = 512
 ARTIFACT_LIMIT = 16 * 1024 * 1024
 MESSAGE_LIMIT = 8192
 
@@ -164,6 +174,9 @@ class SandboxResult(NamedTuple):
     stderr: bytes = b""
     timed_out: bool = False
     overflow: bool = False
+    oom: bool = False
+    # 컨테이너 안에서 프로그램이 돈 시간(초). 시간 초과로 끊겼으면 None
+    elapsed: Optional[float] = None
 
     def text(self) -> str:
         """성공하면 stdout만, 실패하면 진단을 위해 stderr까지 합쳐서 돌려준다."""
@@ -216,6 +229,39 @@ def load_problem(problem_id, public_only: bool):
     return problem.data[0], test_cases
 
 
+def _clamp(value, bounds):
+    return max(bounds[0], min(bounds[1], value))
+
+
+def run_limits(cfg: dict, problem: dict):
+    """문제의 제한에 언어별 보정을 적용한다. 반환값: (실행 시간 제한(초), 메모리 제한(MB))"""
+    time_ms = _clamp(problem.get("time_limit_ms") or DEFAULT_TIME_LIMIT_MS, TIME_LIMIT_RANGE_MS)
+    memory_mb = _clamp(problem.get("memory_limit_mb") or DEFAULT_MEMORY_LIMIT_MB, MEMORY_LIMIT_RANGE_MB)
+    return time_ms / 1000 * cfg["time_factor"] + cfg["time_extra"], int(memory_mb)
+
+
+def _docker_time(value: str) -> float:
+    """Docker가 기록한 RFC 3339 시각(나노초 단위)을 유닉스 초로 바꾼다."""
+    whole, _, fraction = value.rstrip("Z").partition(".")
+    seconds = datetime.strptime(whole, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    return seconds + (float(f"0.{fraction}") if fraction else 0.0)
+
+
+def _run_stats(container, fallback: float):
+    """
+    끝난 컨테이너의 (실행 시간, OOM 여부)를 읽는다.
+    Docker가 남긴 시작/종료 시각을 쓰면 API 호출이 오가는 시간이 실행 시간에 섞이지
+    않는다. 읽지 못하면 워커가 잰 시간(fallback)으로 대신한다.
+    """
+    try:
+        container.reload()
+        state = container.attrs["State"]
+        elapsed = _docker_time(state["FinishedAt"]) - _docker_time(state["StartedAt"])
+        return (elapsed if elapsed >= 0 else fallback), bool(state.get("OOMKilled"))
+    except Exception:
+        return fallback, False
+
+
 def update_status(sub_id: str, status: str):
     try:
         supabase.table("submissions").update({"status": status}).eq("id", sub_id).execute()
@@ -241,7 +287,7 @@ def pull_images_on_startup():
                 print(f"[startup] {lang} 이미지 pull 실패 ({image}): {e}")
 
 
-def _run_container(image: str, command: str, files: dict, *, mem_limit: str,
+def _run_container(image: str, command: str, files: dict, *, mem_mb: int,
                    timeout: float, output_limit: int = OUTPUT_LIMIT) -> SandboxResult:
     """
     공통 컨테이너 실행 헬퍼.
@@ -265,7 +311,9 @@ def _run_container(image: str, command: str, files: dict, *, mem_limit: str,
             detach=False,
             stdin_open=True,
             network_disabled=True,
-            mem_limit=mem_limit,
+            mem_limit=f"{mem_mb}m",
+            # 스왑을 허용하면 메모리 제한을 넘겨 쓸 수 있으므로 같은 값으로 막음
+            memswap_limit=f"{mem_mb}m",
             # 동시 채점끼리 CPU를 나눠 쓰며 실행 시간이 흔들리지 않도록 1코어로 고정
             nano_cpus=1_000_000_000,
             pids_limit=50,
@@ -312,6 +360,7 @@ def _run_container(image: str, command: str, files: dict, *, mem_limit: str,
                 failures.append(exc)
 
         container.start()
+        started = time.monotonic()
         reader = threading.Thread(target=capture, daemon=True)
         reader.start()
         feeder = threading.Thread(target=feed, daemon=True)
@@ -330,6 +379,7 @@ def _run_container(image: str, command: str, files: dict, *, mem_limit: str,
                 pass
             return SandboxResult(None, timed_out=True)
 
+        elapsed, oom = _run_stats(container, fallback=time.monotonic() - started)
         reader.join(timeout=5)
         if reader.is_alive():
             raise RuntimeError("Sandbox output reader did not finish")
@@ -337,11 +387,11 @@ def _run_container(image: str, command: str, files: dict, *, mem_limit: str,
             raise RuntimeError("Sandbox output capture failed") from failures[0]
         stdout, stderr = bytes(output[0]), bytes(output[1])
         if overflow.is_set():
-            return SandboxResult(1, stdout, stderr, overflow=True)
+            return SandboxResult(1, stdout, stderr, overflow=True, elapsed=elapsed)
         exit_code = result.get("StatusCode", -1)
         if exit_code == 125 and BUNDLE_FAILED.encode() in stderr:
             raise RuntimeError("Sandbox bundle delivery failed")
-        return SandboxResult(exit_code, stdout, stderr)
+        return SandboxResult(exit_code, stdout, stderr, oom=oom, elapsed=elapsed)
     finally:
         if container is not None:
             try:
@@ -379,7 +429,7 @@ def build_program(sub_id: str, cfg: dict, code: str):
     command = f"{UNPACK} && {{ {cfg['compile']}; }} 1>&2 && cat /tmp/{cfg['artifact']}"
     result = _run_container(
         cfg["image"], command, source,
-        mem_limit=COMPILE_MEM_LIMIT, timeout=COMPILE_TIMEOUT, output_limit=ARTIFACT_LIMIT,
+        mem_mb=COMPILE_MEM_MB, timeout=COMPILE_TIMEOUT, output_limit=ARTIFACT_LIMIT,
     )
 
     if result.timed_out:
@@ -398,20 +448,25 @@ def build_program(sub_id: str, cfg: dict, code: str):
     return {cfg["artifact"]: result.stdout}, ""
 
 
-def run_one_testcase(sub_id: str, cfg: dict, program: dict, tc: dict):
+def run_one_testcase(sub_id: str, cfg: dict, program: dict, tc: dict,
+                     time_limit: float, memory_mb: int):
     """
     테스트케이스 하나를 컨테이너에서 실행하고 결과를 반환
-    program은 build_program이 돌려준 파일 묶음
+    program은 build_program이 돌려준 파일 묶음, time_limit(초)과 memory_mb는 run_limits의 값
     반환값: (status, actual_output)
     status: "Accepted" | "Wrong Answer" | "Time Limit Exceeded" | "Runtime Error" | "System Error"
     """
     expected_output = tc["output"]
     files = {**program, STDIN_FILE: (tc["input"] or "").encode("utf-8")}
-    command = f"{UNPACK} && {cfg['run']} < /tmp/{STDIN_FILE}"
+    command = f"{UNPACK} && {cfg['run'].replace('{mem}', str(memory_mb))} < /tmp/{STDIN_FILE}"
+    # /tmp(tmpfs)에 푼 프로그램과 입력도 컨테이너 메모리로 잡히므로 그만큼 더 줌
+    bundle_mb = -(-sum(map(len, files.values())) // (1024 * 1024))
 
     try:
         result = _run_container(
-            cfg["image"], command, files, mem_limit=cfg["mem_limit"], timeout=cfg["timeout"],
+            cfg["image"], command, files,
+            mem_mb=memory_mb + cfg["mem_extra"] + bundle_mb,
+            timeout=time_limit + TIME_GRACE,
         )
     except docker.errors.ImageNotFound:
         print(f"[{sub_id}] Docker 이미지 없음: {cfg['image']}")
@@ -420,13 +475,17 @@ def run_one_testcase(sub_id: str, cfg: dict, program: dict, tc: dict):
         print(f"[{sub_id}] 시스템 에러: {str(e)}")
         return "System Error", ""
 
-    if result.timed_out:
+    if result.timed_out or (result.elapsed is not None and result.elapsed > time_limit):
         print(f"[{sub_id}] Testcase: 시간 초과 (Time Limit Exceeded)")
         return "Time Limit Exceeded", ""
 
     if result.overflow:
         print(f"[{sub_id}] Testcase: 출력 초과")
         return "Runtime Error", "Output limit exceeded"
+
+    if result.oom:
+        print(f"[{sub_id}] Testcase: 메모리 초과")
+        return "Runtime Error", "Memory limit exceeded"
 
     logs = result.text()
     if result.exit_code != 0:
@@ -477,7 +536,7 @@ def _process_submission(task: dict):
             update_status(sub_id, "System Error")
         return
 
-    _problem, test_cases = load_problem(task["problem_id"], public_only=is_test)
+    problem, test_cases = load_problem(task["problem_id"], public_only=is_test)
 
     if not test_cases:
         print(f"[{sub_id}] 테스트케이스 없음. 건너뜀.")
@@ -504,12 +563,13 @@ def _process_submission(task: dict):
             update_status(sub_id, "Compile Error")
         return
 
+    time_limit, memory_mb = run_limits(cfg, problem)
     test_results = []
 
     for idx, tc in enumerate(test_cases, 1):
         if is_test and task.get("expires_at", float("inf")) <= time.time():
             return
-        status, actual = run_one_testcase(sub_id, cfg, program, tc)
+        status, actual = run_one_testcase(sub_id, cfg, program, tc, time_limit, memory_mb)
 
         test_results.append({
             "id": idx,

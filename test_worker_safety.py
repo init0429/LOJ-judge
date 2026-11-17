@@ -51,13 +51,16 @@ def load_worker():
 
 FILES = {"main.py": b"print(3)"}
 C = {"image": "gcc", "filename": "main.c", "compile": "gcc -o /tmp/main /tmp/main.c",
-     "artifact": "main", "run": "/tmp/main", "mem_limit": "128m", "timeout": 5.0}
+     "artifact": "main", "run": "/tmp/main", "time_factor": 1, "time_extra": 0.0, "mem_extra": 16}
 PYTHON = {"image": "python", "filename": "main.py", "compile": None,
-          "run": "python3 /tmp/main.py", "mem_limit": "128m", "timeout": 5.0}
+          "run": "python3 /tmp/main.py", "time_factor": 3, "time_extra": 2.0, "mem_extra": 32}
+JAVA = {"image": "jdk", "filename": "Main.java", "compile": "javac", "artifact": "main.jar",
+        "run": "java -Xmx{mem}m Main", "time_factor": 2, "time_extra": 1.0, "mem_extra": 128}
+CASE = {"input": "1 2", "output": "3\n"}
 
 
 def run(worker, files=FILES, **options):
-    options = {"mem_limit": "128m", "timeout": 1} | options
+    options = {"mem_mb": 128, "timeout": 1} | options
     return worker._run_container("python", "run", files, **options)
 
 
@@ -102,13 +105,19 @@ class WorkerSafetyTests(unittest.TestCase):
     def test_container_storage_limits_and_stdout_capture(self):
         worker = load_worker()
         container, _ = sandbox(worker, [(b"3\n", b"diagnostic")])
+        container.attrs = {"State": {
+            "StartedAt": "2026-11-17T08:00:00.250000000Z",
+            "FinishedAt": "2026-11-17T08:00:01.750000000Z",
+            "OOMKilled": False,
+        }}
         result = run(worker)
-        self.assertEqual(result, worker.SandboxResult(0, b"3\n", b"diagnostic"))
+        self.assertEqual(result, worker.SandboxResult(0, b"3\n", b"diagnostic", elapsed=1.5))
         self.assertEqual(result.text(), "3")
         container.logs.assert_not_called()
         worker.docker.types.LogConfig.assert_called_once_with(type="none")
         options = worker.client.containers.create.call_args.kwargs
         self.assertTrue(options["read_only"])
+        self.assertEqual((options["mem_limit"], options["memswap_limit"]), ("128m", "128m"))
         self.assertEqual(options["nano_cpus"], 1_000_000_000)
         self.assertEqual(options["security_opt"], ["no-new-privileges"])
         self.assertIn("size=64m", options["tmpfs"]["/tmp"])
@@ -144,13 +153,57 @@ class WorkerSafetyTests(unittest.TestCase):
 
     def test_testcase_runs_the_prebuilt_program_without_compiling(self):
         worker = load_worker()
-        worker._run_container = Mock(return_value=worker.SandboxResult(0, b"3\n"))
-        status, _ = worker.run_one_testcase("one", C, {"main": b"ELF"}, {"input": "1 2", "output": "3\n"})
+        worker._run_container = Mock(return_value=worker.SandboxResult(0, b"3\n", elapsed=0.4))
+        status, _ = worker.run_one_testcase("one", C, {"main": b"ELF"}, CASE, 1.0, 256)
         self.assertEqual(status, "Accepted")
         image, command, files = worker._run_container.call_args.args
         self.assertEqual(command, f"{worker.UNPACK} && /tmp/main < /tmp/.stdin")
         self.assertEqual(files, {"main": b"ELF", ".stdin": b"1 2"})
-        self.assertEqual(worker._run_container.call_args.kwargs, {"mem_limit": "128m", "timeout": 5.0})
+        # 256MB 제한 + 런타임 몫 16MB + tmpfs에 풀리는 묶음 1MB, 제한 1초 + 여유
+        self.assertEqual(worker._run_container.call_args.kwargs,
+                         {"mem_mb": 256 + 16 + 1, "timeout": 1.0 + worker.TIME_GRACE})
+
+    def test_problem_limits_are_scaled_per_language(self):
+        worker = load_worker()
+        problem = {"time_limit_ms": 1000, "memory_limit_mb": 256}
+        self.assertEqual(worker.run_limits(C, problem), (1.0, 256))
+        self.assertEqual(worker.run_limits(JAVA, problem), (3.0, 256))
+        self.assertEqual(worker.run_limits(PYTHON, problem), (5.0, 256))
+        self.assertEqual(worker.run_limits(C, {}), (2.0, 128))
+        self.assertEqual(worker.run_limits(C, {"time_limit_ms": 10**9, "memory_limit_mb": 1}), (30.0, 16))
+
+    def test_memory_limit_reaches_the_runtime_and_the_container(self):
+        worker = load_worker()
+        worker._run_container = Mock(return_value=worker.SandboxResult(0, b"3", elapsed=0.1))
+        worker.run_one_testcase("one", JAVA, {"main.jar": b"PK"}, CASE, 3.0, 256)
+        self.assertIn("java -Xmx256m Main", worker._run_container.call_args.args[1])
+        self.assertEqual(worker._run_container.call_args.kwargs["mem_mb"], 256 + 128 + 1)
+
+    def test_big_input_does_not_eat_into_the_memory_limit(self):
+        worker = load_worker()
+        worker._run_container = Mock(return_value=worker.SandboxResult(0, b"3", elapsed=0.1))
+        case = {"input": "7" * (5 * 1024 * 1024), "output": "3"}
+        worker.run_one_testcase("one", C, {"main": b"ELF"}, case, 1.0, 128)
+        self.assertEqual(worker._run_container.call_args.kwargs["mem_mb"], 128 + 16 + 6)
+
+    def test_run_time_decides_time_limit_not_only_the_hard_kill(self):
+        worker = load_worker()
+        for result, expected in (
+            (worker.SandboxResult(0, b"3", elapsed=0.99), "Accepted"),
+            (worker.SandboxResult(0, b"3", elapsed=1.2), "Time Limit Exceeded"),
+            (worker.SandboxResult(None, timed_out=True), "Time Limit Exceeded"),
+            (worker.SandboxResult(137, oom=True, elapsed=0.2), "Runtime Error"),
+        ):
+            worker._run_container = Mock(return_value=result)
+            self.assertEqual(worker.run_one_testcase("one", C, {"main": b"ELF"}, CASE, 1.0, 128)[0], expected)
+
+    def test_run_time_falls_back_to_the_worker_clock(self):
+        worker = load_worker()
+        container = Mock()
+        container.attrs = {"State": {"StartedAt": "garbage", "FinishedAt": "garbage"}}
+        self.assertEqual(worker._run_stats(container, fallback=0.7), (0.7, False))
+        container.attrs = {"State": {"StartedAt": "2026-11-17T08:00:00Z", "FinishedAt": "2026-11-17T08:00:02.5Z", "OOMKilled": True}}
+        self.assertEqual(worker._run_stats(container, fallback=0.7), (2.5, True))
 
     def test_compiled_languages_build_once_per_submission(self):
         worker = load_worker()
@@ -164,7 +217,7 @@ class WorkerSafetyTests(unittest.TestCase):
         self.assertEqual([C["compile"] in command for command in commands], [True, False, False, False])
         self.assertTrue(commands[0].endswith("1>&2 && cat /tmp/main"))
         compile_options = worker._run_container.call_args_list[0].kwargs
-        self.assertEqual(compile_options["mem_limit"], worker.COMPILE_MEM_LIMIT)
+        self.assertEqual(compile_options["mem_mb"], worker.COMPILE_MEM_MB)
         self.assertEqual(compile_options["timeout"], worker.COMPILE_TIMEOUT)
         worker.update_status.assert_called_with("one", "Accepted")
 
@@ -224,7 +277,7 @@ class WorkerSafetyTests(unittest.TestCase):
             self.assertTrue(result.overflow)
             self.assertNotEqual(result.exit_code, 0)
             worker._run_container = Mock(return_value=result)
-            self.assertEqual(worker.run_one_testcase("one", PYTHON, FILES, {"input": "", "output": "3"}),
+            self.assertEqual(worker.run_one_testcase("one", PYTHON, FILES, {"input": "", "output": "3"}, 5.0, 128),
                              ("Runtime Error", "Output limit exceeded"))
             container.kill.assert_called_once()
             container.remove.assert_called_once_with(force=True)
