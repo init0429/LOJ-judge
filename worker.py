@@ -272,7 +272,9 @@ def load_problem(problem_id, public_only: bool):
     큐에는 제출 정보만 싣고 테스트 데이터는 여기서 직접 가져오므로, 테스트 데이터가
     큰 문제도 큐 용량 제한에 걸리지 않는다. public_only면 공개 예제만 읽는다(예제 실행).
 
-    반환값: (problem: dict, test_cases: [{"input", "output"}])
+    반환값: (problem: dict, test_cases: [{"input", "output", "example"}])
+    공개 예제를 먼저, 그다음 숨겨진 테스트를 각각 id 순으로 돌려준다. 그래서 제출이 앞쪽
+    k번째에서 틀리면 그게 곧 문제지의 예제 k이고, 흔한 실수는 예제에서 빨리 걸러진다.
     """
     problem = (
         supabase.table("problems")
@@ -285,14 +287,19 @@ def load_problem(problem_id, public_only: bool):
 
     query = (
         supabase.table("test_cases")
-        .select("input_data, expected_output")
+        .select("input_data, expected_output, is_hidden")
         .eq("problem_id", problem_id)
     )
     if public_only:
         query = query.eq("is_hidden", False)
-    rows = query.order("id").execute().data or []
+    rows = query.order("is_hidden").order("id").execute().data or []
     test_cases = [
-        {"input": row["input_data"] or "", "output": row["expected_output"] or ""}
+        {
+            "input": row["input_data"] or "",
+            "output": row["expected_output"] or "",
+            # 공개 예제인지. 확실히 공개된 것만 제출 결과에 입력과 출력을 보여 준다.
+            "example": public_only or row.get("is_hidden") is False,
+        }
         for row in rows
     ]
     return problem.data[0], test_cases
@@ -342,11 +349,42 @@ def outputs_match(actual: str, expected: str) -> bool:
     return lines(actual) == lines(expected)
 
 
-def update_status(sub_id: str, status: str):
+def update_status(sub_id: str, status: str, feedback: Optional[dict] = None):
+    """
+    제출의 판정을 기록한다. feedback(몇 번째 테스트에서 틀렸는지 등)은 판정과 한 번에
+    써서, 화면이 판정을 보는 순간 설명도 함께 읽을 수 있게 한다. feedback 칸이 아직 없는
+    DB(마이그레이션 전)여도 판정만은 남도록 실패하면 판정만 다시 쓴다.
+    """
+    table = supabase.table("submissions")
+    if feedback is not None:
+        try:
+            table.update({"status": status, "feedback": feedback}).eq("id", sub_id).execute()
+            return
+        except Exception as e:
+            print(f"[{sub_id}] 채점 설명 기록 실패, 판정만 기록: {str(e)}")
     try:
-        supabase.table("submissions").update({"status": status}).eq("id", sub_id).execute()
+        table.update({"status": status}).eq("id", sub_id).execute()
     except Exception as e:
         print(f"[{sub_id}] DB 업데이트 실패: {str(e)}")
+
+
+def submission_feedback(results: list, total: int, test_cases: list) -> dict:
+    """
+    제출 화면에 보여 줄 채점 설명. 숨겨진 테스트는 입력은 물론 내 출력도 담지 않는다.
+    입력을 그대로 출력하거나 stderr에 찍고 죽는 코드로 숨겨진 데이터를 빼낼 수 있기 때문.
+    """
+    feedback = {"passed": sum(r["status"] == "Accepted" for r in results), "total": total}
+    failed = next((r for r in results if r["status"] != "Accepted"), None)
+    if failed is not None:
+        feedback["failed_test"] = failed["id"]
+        tc = test_cases[failed["id"] - 1]
+        if tc["example"] and failed["status"] != "System Error":
+            feedback["example"] = {
+                "input": _clip(tc["input"]),
+                "expected": _clip(tc["output"]),
+                "actual": _clip(failed["actual"]),
+            }
+    return feedback
 
 
 def pull_images_on_startup():
@@ -710,6 +748,7 @@ def _process_submission(task: dict):
 
     print(f"\n[{sub_id}] 채점 시작 ({language}, 총 {len(test_cases)}개 테스트케이스, thread={threading.current_thread().name})")
 
+    total = len(test_cases)
     program, message = build_program(sub_id, cfg, code)
     if program is None:
         if is_test:
@@ -717,17 +756,24 @@ def _process_submission(task: dict):
                 "status": "Compile Error",
                 "message": message,
                 "test_cases": [],
+                "total": total,
             }))
         else:
-            update_status(sub_id, "Compile Error")
+            update_status(sub_id, "Compile Error", {"passed": 0, "total": total, "message": message})
         return
 
     time_limit, memory_mb = run_limits(cfg, problem)
+    deadline = task.get("expires_at", float("inf"))
     test_results = []
 
     for idx, tc in enumerate(test_cases, 1):
-        if is_test and task.get("expires_at", float("inf")) <= time.time():
-            return
+        if is_test:
+            # 예제 실행은 틀려도 끝까지 돌려서 예제마다 결과를 보여 준다. 다만 하나가 시간
+            # 제한까지 다 쓸 수 있으니, API가 기다리는 시간을 넘길 것 같으면 거기서 멈추고
+            # 돌린 것까지만 보낸다. 첫 예제는 남은 시간이 빠듯해도 돌린다.
+            now = time.time()
+            if now >= deadline or (test_results and now + time_limit + TIME_GRACE > deadline):
+                break
         status, actual = run_one_testcase(sub_id, cfg, program, tc, time_limit, memory_mb)
 
         test_results.append({
@@ -735,31 +781,29 @@ def _process_submission(task: dict):
             "status": status,
             "input": _clip(tc["input"]) if is_test else "",
             "expected": _clip(tc["output"]) if is_test else "",
-            "actual": _clip(actual) if is_test else "",
+            # 제출은 틀린 테스트의 출력만 설명에 쓰므로 맞은 테스트의 출력은 쌓아 두지 않는다.
+            "actual": _clip(actual) if is_test or status != "Accepted" else "",
         })
 
-        if status != "Accepted":
-            if is_test:
-                # 테스트 모드는 첫 실패에서 멈추고 전체 결과를 바로 리턴
-                break
-            else:
-                update_status(sub_id, status)
-                return
+        if status != "Accepted" and not is_test:
+            update_status(sub_id, status, submission_feedback(test_results, total, test_cases))
+            return
 
     if is_test:
-        overall_status = "Accepted"
-        for tr in test_results:
-            if tr["status"] != "Accepted":
-                overall_status = tr["status"]
-                break
-
+        if not test_results:
+            return
+        overall_status = next(
+            (tr["status"] for tr in test_results if tr["status"] != "Accepted"), "Accepted",
+        )
         r.publish(f"test_result:{sub_id}", json.dumps({
             "status": overall_status,
-            "test_cases": test_results
+            "test_cases": test_results,
+            # test_cases가 이보다 적으면 시간이 모자라 뒤쪽 예제를 돌리지 못한 것
+            "total": total,
         }))
         return
 
-    update_status(sub_id, "Accepted")
+    update_status(sub_id, "Accepted", submission_feedback(test_results, total, test_cases))
     print(f"[{sub_id}] 모든 테스트케이스 통과! ✓ (Accepted)\n")
 
 

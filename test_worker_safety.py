@@ -251,7 +251,7 @@ class WorkerSafetyTests(unittest.TestCase):
         compile_options = worker._run_container.call_args_list[0].kwargs
         self.assertEqual(compile_options["mem_mb"], worker.COMPILE_MEM_MB)
         self.assertEqual(compile_options["timeout"], worker.COMPILE_TIMEOUT)
-        worker.update_status.assert_called_with("one", "Accepted")
+        worker.update_status.assert_called_with("one", "Accepted", {"passed": 3, "total": 3})
 
     def test_test_cases_come_from_the_database_not_the_queue(self):
         worker = load_worker()
@@ -264,7 +264,10 @@ class WorkerSafetyTests(unittest.TestCase):
         ]
         problem, cases = worker.load_problem(7, public_only=True)
         self.assertEqual(problem, {"time_limit_ms": 1000, "memory_limit_mb": 256})
-        self.assertEqual(cases, [{"input": "1 2", "output": "3"}, {"input": "", "output": "0"}])
+        self.assertEqual(cases, [
+            {"input": "1 2", "output": "3", "example": True},
+            {"input": "", "output": "0", "example": True},
+        ])
         query.eq.assert_any_call("is_hidden", False)
 
     def test_hidden_cases_are_included_for_submissions(self):
@@ -402,6 +405,111 @@ class TestRunPayloadTests(unittest.TestCase):
         self.assertEqual(result["status"], "Wrong Answer")
         self.assertLess(len(payload), worker.TEST_FIELD_LIMIT * 8)
         self.assertTrue(result["test_cases"][0]["input"].endswith("(이하 생략)"))
+
+    def test_every_example_runs_even_after_a_failure(self):
+        worker = load_worker()
+        worker.LANGUAGES = {"python": PYTHON}
+        cases = [{"input": str(n), "output": "1", "example": True} for n in range(3)]
+        worker.load_problem = Mock(return_value=({}, cases))
+        worker._run_container = Mock(side_effect=[
+            worker.SandboxResult(0, b"2", elapsed=0.1),
+            worker.SandboxResult(0, b"1", elapsed=0.1),
+            worker.SandboxResult(1, b"", b"Traceback", elapsed=0.1),
+        ])
+        worker._process_submission({"submission_id": "t", "problem_id": 1, "language": "python", "code": "x", "is_test": True})
+        result = json.loads(worker.r.publish.call_args.args[1])
+        self.assertEqual(result["status"], "Wrong Answer")
+        self.assertEqual(result["total"], 3)
+        self.assertEqual([c["status"] for c in result["test_cases"]], ["Wrong Answer", "Accepted", "Runtime Error"])
+        self.assertEqual(result["test_cases"][0]["actual"], "2")
+        self.assertIn("Traceback", result["test_cases"][2]["actual"])
+
+    def test_examples_that_would_outlast_the_wait_are_skipped(self):
+        worker = load_worker()
+        worker.LANGUAGES = {"python": PYTHON}
+        cases = [{"input": "", "output": "1", "example": True}] * 3
+        worker.load_problem = Mock(return_value=({"time_limit_ms": 1000}, cases))
+        worker._run_container = Mock(return_value=worker.SandboxResult(0, b"1", elapsed=0.1))
+        # 파이썬 제한은 1초 × 3 + 2 = 5초. 첫 예제는 남은 시간이 빠듯해도 돌리고 그다음은 멈춘다.
+        task = {"submission_id": "t", "problem_id": 1, "language": "python", "code": "x",
+                "is_test": True, "expires_at": worker.time.time() + 4}
+        worker._process_submission(task)
+        result = json.loads(worker.r.publish.call_args.args[1])
+        self.assertEqual((len(result["test_cases"]), result["total"]), (1, 3))
+        self.assertEqual(result["status"], "Accepted")
+
+    def test_compile_errors_are_sent_with_the_example_count(self):
+        worker = load_worker()
+        worker.LANGUAGES = {"c": C}
+        worker.load_problem = Mock(return_value=({}, [CASE] * 2))
+        worker._run_container = Mock(return_value=worker.SandboxResult(1, b"", b"main.c:1: error"))
+        worker._process_submission({"submission_id": "t", "problem_id": 1, "language": "c", "code": "x", "is_test": True})
+        result = json.loads(worker.r.publish.call_args.args[1])
+        self.assertEqual((result["status"], result["total"], result["test_cases"]), ("Compile Error", 2, []))
+
+
+class SubmissionFeedbackTests(unittest.TestCase):
+    def judge(self, cases, outputs, language="python", config=PYTHON):
+        worker = load_worker()
+        worker.LANGUAGES = {language: config}
+        worker.update_status = Mock()
+        worker.load_problem = Mock(return_value=({}, cases))
+        worker._run_container = Mock(side_effect=outputs)
+        worker._process_submission({"submission_id": "s", "problem_id": 1, "language": language, "code": "x"})
+        return worker, worker.update_status.call_args.args
+
+    def test_a_failed_example_is_shown_in_full(self):
+        cases = [{"input": "1 2", "output": "3", "example": True}, {"input": "secret", "output": "9", "example": False}]
+        worker, (sub_id, status, feedback) = self.judge(cases, [load_worker().SandboxResult(0, b"4")])
+        self.assertEqual((sub_id, status), ("s", "Wrong Answer"))
+        self.assertEqual(feedback, {
+            "passed": 0, "total": 2, "failed_test": 1,
+            "example": {"input": "1 2", "expected": "3", "actual": "4"},
+        })
+
+    def test_a_failed_hidden_test_reveals_only_its_position(self):
+        worker = load_worker()
+        cases = [{"input": "1 2", "output": "3", "example": True}, {"input": "secret", "output": "9", "example": False}]
+        _, (_, status, feedback) = self.judge(cases, [
+            worker.SandboxResult(0, b"3"),
+            worker.SandboxResult(1, b"secret", b"secret"),
+        ])
+        self.assertEqual(status, "Runtime Error")
+        self.assertEqual(feedback, {"passed": 1, "total": 2, "failed_test": 2})
+        self.assertNotIn("secret", json.dumps(feedback))
+
+    def test_compile_errors_keep_the_compiler_message(self):
+        worker = load_worker()
+        _, (_, status, feedback) = self.judge([CASE], [worker.SandboxResult(1, b"", b"main.c:1: error")], "c", C)
+        self.assertEqual(status, "Compile Error")
+        self.assertEqual(feedback, {"passed": 0, "total": 1, "message": "main.c:1: error"})
+
+    def test_the_verdict_survives_a_database_without_the_feedback_column(self):
+        worker = load_worker()
+        query = worker.supabase.table.return_value
+        query.update.return_value.eq.return_value.execute.side_effect = [Exception("PGRST204 feedback"), None]
+        worker.update_status("s", "Accepted", {"passed": 1, "total": 1})
+        self.assertEqual(
+            [c.args[0] for c in query.update.call_args_list],
+            [{"status": "Accepted", "feedback": {"passed": 1, "total": 1}}, {"status": "Accepted"}],
+        )
+
+    def test_examples_are_judged_before_hidden_tests(self):
+        worker = load_worker()
+        query = worker.supabase.table.return_value
+        for method in ("select", "eq", "order"):
+            getattr(query, method).return_value = query
+        query.execute.side_effect = [
+            SimpleNamespace(data=[{}]),
+            SimpleNamespace(data=[
+                {"input_data": "a", "expected_output": "1", "is_hidden": False},
+                {"input_data": "b", "expected_output": "2", "is_hidden": True},
+                {"input_data": "c", "expected_output": "3", "is_hidden": None},
+            ]),
+        ]
+        _, cases = worker.load_problem(7, public_only=False)
+        self.assertEqual([c.args for c in query.order.call_args_list], [("is_hidden",), ("id",)])
+        self.assertEqual([c["example"] for c in cases], [True, False, False])
 
 
 if __name__ == "__main__":
